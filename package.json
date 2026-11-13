@@ -1,0 +1,46 @@
+{
+  "name": "arbor-outliner",
+  "productName": "Arbor Outliner",
+  "version": "1.0.0",
+  "description": "An outliner for Windows: rows, columns, checkboxes, styles, notes, focus and filters.",
+  "main": "main.js",
+  "author": "Arbor Outliner",
+  "license": "MIT",
+  "repository": "https://github.com/c0linzeal/arbor-outliner",
+  "scripts": {
+    "start": "electron .",
+    "build": "node scripts/build-web.js",
+    "test": "node test/model.test.js && electron . --smoke",
+    "icon": "node scripts/make-icon.js",
+    "dist": "electron-builder --win --publish never",
+    "release": "electron-builder --win --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
+  },
+  "devDependencies": {
+    "electron": "^45.3.1",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "io.github.c0linzeal.arbor-outliner",
+    "productName": "Arbor Outliner",
+    "directories": { "output": "release", "buildResources": "build" },
+    "files": ["main.js", "preload.js", "src/**/*", "build/icon.png", "package.json"],
+    "win": { "target": ["nsis"], "icon": "build/icon.png" },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Arbor Outliner",
+      "artifactName": "Arbor-Outliner-Setup-${version}.${ext}"
+    },
+    "fileAssociations": [
+      { "ext": "arbor", "name": "Arbor Outline", "description": "Arbor outline", "role": "Editor" },
+      { "ext": "opml", "name": "OPML Outline", "description": "OPML outline", "role": "Editor" }
+    ],
+    "protocols": [{ "name": "Arbor Outliner link", "schemes": ["arbor"] }],
+    "publish": [{ "provider": "github", "owner": "c0linzeal", "repo": "arbor-outliner", "releaseType": "release" }]
+  }
+}
