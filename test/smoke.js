@@ -5,7 +5,7 @@ const os = require('os');
 const path = require('path');
 const { clipboard } = require('electron');
 
-module.exports = async ({ createWindow, app, wins }) => {
+module.exports = async ({ createWindow, app, wins, openQuickAdd }) => {
   const results = []; let failed = 0;
   const wait = ms => new Promise(r => setTimeout(r, ms));
   const win = createWindow();
@@ -328,6 +328,54 @@ module.exports = async ({ createWindow, app, wins }) => {
     eq(got.title, 'Essay Outline', 'title');
     w2.destroy(); await wait(200);
   });
+  const ooFile = path.join(os.tmpdir(), `arbor-smoke-${Date.now()}.ooutline`), ooDir = path.join(os.tmpdir(), `arbor-smoke-${Date.now()}-pkg.oo3`);
+  await check('opening an OmniOutliner document, and a Mac package folder', async () => {
+    const O = require('../src/office.js'), lit = t => `<text><p><run><lit>${t}</lit></run></p></text>`;
+    fs.writeFileSync(ooFile, O.zip({ 'contents.xml': `<?xml version="1.0"?><outline xmlns="http://www.omnigroup.com/namespace/OmniOutliner/v5">
+      <columns outline-column="t" note-column="n"><column id="n" type="text"/><column id="t" type="text"/></columns>
+      <items><item is-root="yes" rank=""><entry/><entry/></item><item id="a" rank="1"><entry/>${lit('Packing')}</item>
+      <item id="b" parent-id="a" rank="1">${lit('warm')}${lit('Coat')}</item></items></outline>` }));
+    fs.mkdirSync(ooDir, { recursive: true });
+    fs.writeFileSync(path.join(ooDir, 'contents.xml'), `<?xml version="1.0"?><outline xmlns="http://www.omnigroup.com/namespace/OmniOutliner/v3">
+      <columns><column id=":1" type="text" is-outline-column="yes"/></columns><root><item expanded="yes"><values>${lit('Week')}</values>
+      <children><item state="checked"><values>${lit('Mon')}</values></item></children></item></root></outline>`);
+    for (const [p, want] of [[ooFile, ['Packing', 'Coat|warm']], [ooDir, ['Week', 'Mon']]]) {
+      const w2 = createWindow(p); await new Promise(r => w2.webContents.once('did-finish-load', r)); await wait(500);
+      eq(JSON.parse(await w2.webContents.executeJavaScript(`JSON.stringify(${A}.M.allRows(${A}.state.doc).map(r => r.text + (r.note ? '|' + r.note : '')))`)), want, path.extname(p));
+      w2.destroy(); await wait(150);
+    }
+  });
+  await check('due rows: sidebar count, Due filter and a reminder notification', async () => {
+    await js(`{ const d = ${A}.M.fromTemplate('project'); d.root.children[0].children[0].values[d.columns[1].id] = '2000-01-01'; ${A}.setDoc(d, null);
+      window.__notes = []; window.Notification = class { constructor(t, o) { window.__notes.push([t, o.body]); this.onclick = null; } }; void 0; }`); await wait(150);
+    await js(`${A}.checkReminders(true)`);
+    eq(JSON.parse(await js(`JSON.stringify(window.__notes)`)), [['1 row is due in Project Plan', '1 overdue. Define goals']], 'notification');
+    const dueItem = `[...document.querySelectorAll('#sidebar .item')].find(i => i.textContent.startsWith('Due or overdue'))`;
+    eq(await js(`${dueItem}.querySelector('.count').textContent`), '1', 'sidebar count');
+    await js(`${dueItem}.click()`); await wait(80);
+    eq(JSON.parse(await js(`JSON.stringify([...document.querySelectorAll('#rows .topic')].map(t => t.textContent))`)), ['Plan', 'Define goals'], 'due filter');
+    await js(`${A}.run('clearFilter')`);
+  });
+  await check('Quick Add puts a row into an open outline, or straight into a closed outline file', async () => {
+    const qwin = async () => { const q = openQuickAdd(); q.webContents.on('console-message', e => { if (e.level === 'error') pageErrors.push('quick: ' + e.message); }); if (q.webContents.isLoading()) await new Promise(r => q.webContents.once('did-finish-load', r)); await wait(300); return q; };
+    const submit = async (q, key, text) => {
+      await q.webContents.executeJavaScript(`document.getElementById('target').value = ${JSON.stringify(key)}; document.getElementById('text').value = ${JSON.stringify(text)}; document.getElementById('text').focus()`);
+      q.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' }); q.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+      await wait(500);
+    };
+    let q = await qwin();
+    eq(await q.webContents.executeJavaScript(`[...document.getElementById('target').options].some(o => o.value === 'win:${wc.id}')`), true, 'open outline offered');
+    await submit(q, 'win:' + wc.id, 'Call the venue');
+    eq(await js(`${A}.state.doc.root.children.slice(-1)[0].text`), 'Call the venue', 'row added to the open outline');
+    eq(q.isDestroyed(), true, 'box closes after Enter');
+    const file = path.join(os.tmpdir(), `arbor-smoke-${Date.now()}-inbox.arbor`);
+    fs.writeFileSync(file, JSON.stringify(require('../src/model.js').newDoc('Inbox')));
+    const w3 = createWindow(file); await new Promise(r => w3.webContents.once('did-finish-load', r)); await wait(300); w3.destroy(); await wait(150);
+    q = await qwin();
+    await submit(q, 'file:' + path.resolve(file).toLowerCase(), 'Buy stamps');
+    eq(JSON.parse(fs.readFileSync(file, 'utf8')).root.children.map(r => r.text), ['Buy stamps'], 'written into the closed file');
+    fs.unlinkSync(file);
+  });
   await check('new window opens', async () => {
     await js(`${A}.run('newDoc')`); await wait(800);
     eq(wins.size, 2, 'window count');
@@ -349,8 +397,15 @@ module.exports = async ({ createWindow, app, wins }) => {
     await key('Escape'); await key('F', 'control');
     await js(`{ const f = document.getElementById('findText'); f.value = 'e'; f.dispatchEvent(new Event('input')); }`); await wait(200);
     fs.writeFileSync(process.env.SMOKE_SHOT + '-find.png', (await wc.capturePage()).toPNG());
+    await js(`${A}.run('closeFind'); { const d = ${A}.M.fromTemplate('project'); d.root.children[0].children[0].values[d.columns[1].id] = '2000-01-01'; ${A}.setDoc(d, null); ${A}.run('showDue'); }`); await wait(300);
+    fs.writeFileSync(process.env.SMOKE_SHOT + '-due.png', (await wc.capturePage()).toPNG());
+    const q = openQuickAdd(); await new Promise(r => q.webContents.once('did-finish-load', r)); await wait(400);
+    await q.webContents.executeJavaScript(`document.getElementById('text').value = 'Email the caterer'`);
+    fs.writeFileSync(process.env.SMOKE_SHOT + '-quick.png', (await q.webContents.capturePage()).toPNG());
+    q.close();
   }
   for (const f of [tmp, opml, docx]) try { fs.unlinkSync(f); } catch { /* already gone */ }
+  try { fs.unlinkSync(ooFile); fs.rmSync(ooDir, { recursive: true }); } catch { /* already gone */ }
   console.log('\n' + results.join('\n') + `\n\n${results.length - failed} passed, ${failed} failed`);
   app.exit(failed ? 1 : 0);
 };

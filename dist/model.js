@@ -23,8 +23,10 @@
   };
   const TYPES = Object.keys(SUMMARIES);
 
+  // Date columns remind about rows that are due, unless the name says it is another kind of date.
+  const remindByDefault = (type, name) => type === 'date' && !/start|begin|creat|added|done|complet|finish|birth|modif|sent|receiv/i.test(name || '');
   function column(name, type = 'text', extra = {}) {
-    return Object.assign({ id: uid(), name, type, summary: 'none', options: [], width: type === 'checkbox' ? 80 : 120, hidden: false }, extra);
+    return Object.assign({ id: uid(), name, type, summary: 'none', options: [], width: type === 'checkbox' ? 80 : 120, hidden: false, remind: remindByDefault(type, name) }, extra);
   }
 
   function newDoc(title = 'Untitled') {
@@ -136,8 +138,20 @@
     const b = parseValue(col, rule.value); if (b === undefined) return true;
     return { eq: v === b, ne: v !== b, lt: v < b, le: v <= b, gt: v > b, ge: v >= b }[op] !== false;
   }
-  function matchesFilter(doc, r, q, status, rules) {
+  // Rows due today or earlier, in columns that remind, that are not checked off.
+  const remindColumns = doc => doc.columns.filter(c => c.type === 'date' && c.remind);
+  function isDue(doc, r, today = isoToday()) {
+    if (statusOf(r) === 'checked') return false;
+    return remindColumns(doc).some(c => { const v = r.values[c.id]; return !!v && v <= today; });
+  }
+  function dueRows(doc, today = isoToday()) {
+    const out = [];
+    walk(doc.root, r => { if (isDue(doc, r, today)) out.push({ row: r, overdue: remindColumns(doc).every(c => !r.values[c.id] || r.values[c.id] < today) }); });
+    return out;
+  }
+  function matchesFilter(doc, r, q, status, rules, due) {
     if (status && status !== 'all' && (status === 'checked') !== (statusOf(r) === 'checked')) return false;
+    if (due && !isDue(doc, r)) return false;
     if (rules && !rules.every(rule => matchRule(doc, r, rule))) return false;
     if (!q) return true;
     const vals = doc.columns.map(c => formatValue(c, r.values[c.id])).join(' ');
@@ -148,11 +162,12 @@
     const q = (opts.text || '').trim().toLowerCase();
     const status = opts.status || 'all';
     const rules = (opts.rules || []).filter(x => doc.columns.some(c => c.id === x.col));
-    const filtering = !!q || status !== 'all' || rules.length > 0;
+    const due = !!opts.due;
+    const filtering = !!q || status !== 'all' || rules.length > 0 || due;
     const memo = new Map();
     const keep = r => {
       if (memo.has(r.id)) return memo.get(r.id);
-      const k = matchesFilter(doc, r, q, status, rules) || r.children.some(keep);
+      const k = matchesFilter(doc, r, q, status, rules, due) || r.children.some(keep);
       memo.set(r.id, k);
       return k;
     };
@@ -312,6 +327,7 @@
       if (type === 'popup' && !col.options.includes(v)) col.options.push(v);
     });
     col.type = type;
+    col.remind = remindByDefault(type, col.name);
     if (!SUMMARIES[type].includes(col.summary)) col.summary = 'none';
   }
   function sortChildren(doc, parent, colId, dir = 1) {
@@ -603,7 +619,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #e5e5e5;
 
   return {
     uid, row, column, newDoc, normalize, walk, find, ancestors, contains, topLevel, allRows,
-    statusOf, setStatus, visibleRows, matchRule, RULE_OPS, guessType, indent, outdent, moveUp, moveDown, deleteRows, duplicate, moveTo, insertRows, clone,
+    statusOf, setStatus, visibleRows, matchRule, RULE_OPS, guessType, isDue, dueRows, remindColumns, isoToday, indent, outdent, moveUp, moveDown, deleteRows, duplicate, moveTo, insertRows, clone,
     parseDuration, formatDuration, parseValue, formatValue, cellValue, setCheckboxCell, convertColumn, sortChildren,
     prefix, numberPaths, resolveStyle, styleCss, stats,
     toOPML, fromOPML, toMarkdown, fromMarkdown, toText, fromText, rowsToText, toCSV, toHTML,

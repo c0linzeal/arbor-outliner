@@ -179,5 +179,85 @@ const deflateZip = require('./deflate-zip.js');
   assert.strictEqual(s.root.children[0].note, 'Kick-off');
   assert.strictEqual(s.root.children[0].children[0].state, true);
   await assert.rejects(O.fromDOCX(new Uint8Array(100), 'x'), /not an Office document/);
+
+  // OmniOutliner 5: a flat list of items with parent ids and ranks (siblings out of order on purpose)
+  const lit = t => `<text><p><run><lit>${t}</lit></run></p></text>`;
+  const v5 = `<?xml version="1.0" encoding="UTF-8"?>
+<?xml-model href="http://www.omnigroup.com/namespace/OmniOutliner/xmloutline-v5.rng" type="application/xml"?>
+<outline xmlns="http://www.omnigroup.com/namespace/OmniOutliner/v5">
+  <outline-title><text><p><run><style><value key="font-size">12</value></style><lit>Trip</lit></run></p></text></outline-title>
+  <columns id="s1" is-base-schema="yes" outline-column="t" status-column="c" note-column="n">
+    <style><value key="x">1</value></style>
+    <column id="c" type="checkbox"><title><text><p/></text></title></column>
+    <column id="n" type="text"><title><text><p/></text></title></column>
+    <column id="t" type="text"><title>${lit('Topic')}</title></column>
+    <column id="cost" type="number" summary="sum"><title>${lit('Cost')}</title></column>
+    <column id="due" type="date"><title>${lit('Due')}</title></column>
+  </columns>
+  <items>
+    <item rank="" is-root="yes" schema="s1"><checkbox>unchecked</checkbox><entry/><entry/><entry/><entry/></item>
+    <item id="b" rank="0002"><checkbox>unchecked</checkbox><entry/>${lit('Book')}<entry/><entry/></item>
+    <item id="a" rank="0001"><style/><checkbox>indeterminate</checkbox>${lit('Bring layers')}${lit('Pack')}<entry/><entry/></item>
+    <item id="a2" parent-id="a" rank="0002"><checkbox>unchecked</checkbox><entry/>${lit('Socks')}<number>4</number><entry/></item>
+    <item id="a1" parent-id="a" rank="0001"><checkbox>checked</checkbox><entry/>${lit('Passport &amp; visa')}<number>60</number><date>2026-12-01</date></item>
+  </items>
+</outline>`;
+  const show = d => { const out = []; M.walk(d.root, (r, dp) => { out.push('  '.repeat(dp) + (r.state ? '[x] ' : '') + r.text + (r.note ? ' {' + r.note + '}' : '')); }); return out; };
+  for (const input of [v5, O.zip({ 'contents.xml': v5 }), O.zip({ 'Trip.ooutline/contents.xml': v5 }), require('zlib').gzipSync(v5)]) {
+    const oo = await O.fromOmniOutliner(input, 'x');
+    assert.strictEqual(oo.title, 'Trip');
+    assert.deepStrictEqual(show(oo), ['Pack {Bring layers}', '  [x] Passport & visa', '  Socks', 'Book'], 'ranks order the siblings');
+    assert.ok(oo.statusVisible);
+    assert.deepStrictEqual(oo.columns.map(c => c.name + ':' + c.type + ':' + c.summary), ['Cost:number:sum', 'Due:date:none']);
+    assert.strictEqual(M.cellValue(oo, oo.root.children[0], oo.columns[0]).value, 64, 'number values and the total');
+    assert.strictEqual(oo.root.children[0].children[0].values[oo.columns[1].id], '2026-12-01');
+  }
+  // OmniOutliner 3/4: nested items, checkbox state on the item, a separate note, collapsed rows
+  const v3 = `<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE outline PUBLIC "-//omnigroup.com//DTD OUTLINE 3.0//EN" "http://www.omnigroup.com/namespace/OmniOutliner/xmloutline-v3.dtd">
+<outline xmlns="http://www.omnigroup.com/namespace/OmniOutliner/v3">
+  <columns>
+    <column id=":0" type="text" is-note-column="yes"><title><text><p><run><lit/></run></p></text></title></column>
+    <column id=":1" type="text" is-outline-column="yes"><title>${lit('Topic')}</title></column>
+    <column id=":2" type="text"><title>${lit('Who')}</title></column>
+  </columns>
+  <root><style/>
+    <item id="x" state="indeterminate"><values>${lit('Week')}<null/></values><note>${lit('Busy one')}</note>
+      <children>
+        <item id="y" state="checked"><values>${lit('Mon')}${lit('Ana')}</values></item>
+        <item id="z" state="unchecked"><values><text><p><run><lit>Tue</lit></run></p><p><run><lit>(late)</lit></run></p></text><null/></values>
+          <children><item><values>${lit('Gym')}<null/></values></item></children></item>
+      </children></item>
+  </root>
+</outline>`;
+  const o3 = await O.fromOmniOutliner(v3, 'Plan');
+  assert.deepStrictEqual(show(o3), ['Week {Busy one}', '  [x] Mon', '  Tue\n(late)', '    Gym']);
+  assert.strictEqual(o3.root.children[0].children[1].collapsed, true, 'items without expanded="yes" start collapsed');
+  assert.strictEqual(o3.root.children[0].children[0].values[o3.columns[0].id], 'Ana');
+  await assert.rejects(O.fromOmniOutliner('<opml/>', 'x'), /could not find an outline/);
+
+  // Excel and CSV come back with levels, checkboxes, notes, typed columns and summaries
+  const pj = M.fromTemplate('project');
+  pj.root.children[0].note = 'Kick-off'; pj.root.children[0].children[0].state = true; pj.root.children[0].children[0].values[pj.columns[1].id] = '2026-12-01';
+  for (const back2 of [await O.fromXLSX(deflateZip(O.toXLSX(pj)), 'x'), O.fromCSV(M.toCSV(pj), 'x')]) {
+    assert.deepStrictEqual(show(back2), show(pj));
+    assert.deepStrictEqual(back2.columns.map(c => c.name + ':' + c.type + ':' + c.summary), ['Owner:text:none', 'Due:date:max', 'Estimate:duration:sum', 'Priority:text:none']);
+    assert.deepStrictEqual(back2.root.children[0].values, {}, 'parent totals become summaries, not values');
+  }
+  const plain = O.fromCSV('Name;Score;Note\n"Smith, Ana";12;"said ""hi"""\nLee;7;\n', 'Class');
+  assert.deepStrictEqual(show(plain), ['Smith, Ana {said "hi"}', 'Lee']);
+  assert.strictEqual(plain.columns[0].type, 'number');
+  const lv = O.fromCSV('Level,Topic\n1,A\n2,B\n3,C\n1,D\n', 'x');
+  assert.deepStrictEqual(show(lv), ['A', '  B', '    C', 'D']);
+
+  // Due dates: date columns remind unless their name says otherwise; checked rows are never due
+  assert.strictEqual(M.column('Due', 'date').remind, true);
+  assert.strictEqual(M.column('Start date', 'date').remind, false);
+  const dd = M.fromTemplate('project'), dueCol = dd.columns[1], [r1, r2] = dd.root.children[0].children;
+  r1.values[dueCol.id] = '2000-01-01'; r2.values[dueCol.id] = '2999-01-01';
+  assert.deepStrictEqual(M.dueRows(dd).map(x => x.row.text + (x.overdue ? ' overdue' : '')), ['Define goals overdue']);
+  assert.deepStrictEqual(M.visibleRows(dd, { due: true }).map(v => v.row.text), ['Plan', 'Define goals']);
+  r1.state = true;
+  assert.strictEqual(M.dueRows(dd).length, 0);
   console.log('model tests passed');
 })().catch(err => { console.error(err); process.exit(1); });

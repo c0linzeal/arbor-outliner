@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'">
+  <title>Quick Add</title>
+  <style>
+    :root { --bg: #ffffff; --fg: #1f1f1f; --muted: #6b6b6b; --line: #dcdcdc; --accent: #2f6fde; --chrome: #f6f6f5; font: 13px "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #26282c; --fg: #e8e8e8; --muted: #9a9a9a; --line: #3a3d43; --accent: #6ea0ff; --chrome: #1e1f22; } }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+    body { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; border: 1px solid var(--line); -webkit-app-region: drag; }
+    input, select, button { font: inherit; color: inherit; -webkit-app-region: no-drag; }
+    #text { width: 100%; font-size: 17px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--chrome); outline: none; }
+    #text:focus { border-color: var(--accent); }
+    .bar { display: flex; align-items: center; gap: 8px; }
+    .bar label { color: var(--muted); }
+    select { flex: 1; min-width: 0; padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); }
+    #msg { color: var(--muted); font-size: 12px; min-height: 1.3em; }
+    #msg.warn { color: #c2410c; }
+  </style>
+</head>
+<body>
+  <input id="text" placeholder="Add a row…" autocomplete="off" spellcheck="true">
+  <div class="bar"><label for="target">Add to</label><select id="target"></select></div>
+  <div id="msg"></div>
+  <script src="quick.js"></script>
+</body>
+</html>

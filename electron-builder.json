@@ -34,6 +34,12 @@
       "role": "Editor"
     },
     {
+      "ext": ["ooutline", "oo3"],
+      "name": "OmniOutliner document",
+      "description": "OmniOutliner document",
+      "role": "Viewer"
+    },
+    {
       "ext": "opml",
       "name": "OPML Outline",
       "description": "OPML outline",

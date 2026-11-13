@@ -1,5 +1,5 @@
 // Arbor Outliner: Windows app shell (windows, menus, files, updates).
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell, clipboard, nativeTheme } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell, clipboard, nativeTheme, globalShortcut, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -11,14 +11,19 @@ if (SMOKE) {
   app.commandLine.appendSwitch('use-fake-device-for-media-stream'); app.commandLine.appendSwitch('use-fake-ui-for-media-stream');
   app.setPath('userData', path.join(require('os').tmpdir(), 'arbor-smoke-profile'));
 }
-const DOC_EXT = /\.(arbor|opml|md|markdown|txt|rtf|docx|pptx)$/i;
-const BINARY = /\.(docx|pptx)$/i; // read as bytes, not text
-const readDoc = p => BINARY.test(p) ? fs.readFileSync(p) : fs.readFileSync(p, 'utf8');
+const DOC_EXT = /\.(arbor|opml|md|markdown|txt|rtf|docx|pptx|xlsx|csv|ooutline|oo3|oo3template|otemplate)$/i;
+const BINARY = /\.(docx|pptx|xlsx|ooutline|oo3|oo3template|otemplate|zip)$/i; // read as bytes, not text
+// A Mac OmniOutliner document can be a folder ("package"); its outline is contents.xml inside.
+function readDoc(p) {
+  if (fs.statSync(p).isDirectory()) return fs.readFileSync(path.join(p, 'contents.xml'));
+  return BINARY.test(p) ? fs.readFileSync(p) : fs.readFileSync(p, 'utf8');
+}
 const FILTERS = {
-  all: [{ name: 'Outlines and documents', extensions: ['arbor', 'opml', 'md', 'markdown', 'txt', 'rtf', 'docx', 'pptx'] }, { name: 'All files', extensions: ['*'] }],
+  all: [{ name: 'Outlines and documents', extensions: ['arbor', 'opml', 'ooutline', 'oo3', 'md', 'markdown', 'txt', 'rtf', 'docx', 'pptx', 'xlsx', 'csv'] }, { name: 'All files', extensions: ['*'] }],
   arbor: [{ name: 'Arbor outline', extensions: ['arbor'] }],
   save: [{ name: 'Arbor outline', extensions: ['arbor'] }, { name: 'OPML outline (keeps rows, notes, checkboxes and columns)', extensions: ['opml'] }],
   rtf: [{ name: 'Rich Text', extensions: ['rtf'] }],
+  omni: [{ name: 'OmniOutliner document', extensions: ['ooutline', 'oo3', 'oo3template', 'otemplate', 'zip'] }],
   xlsx: [{ name: 'Excel workbook', extensions: ['xlsx'] }],
   docx: [{ name: 'Word document', extensions: ['docx'] }],
   pptx: [{ name: 'PowerPoint presentation', extensions: ['pptx'] }],
@@ -68,7 +73,8 @@ function createWindow(file, extra = {}) {
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true, spellcheck: true },
   });
   const id = win.webContents.id;
-  const s = { win, path: null, dirty: false, force: false, group: extra.mirror ? extra.mirror.group : 0 };
+  const s = { win, path: null, dirty: false, force: false, group: extra.mirror ? extra.mirror.group : 0, focusedAt: Date.now() };
+  win.on('focus', () => { s.focusedAt = Date.now(); });
   wins.set(id, s);
   win.loadFile(path.join(__dirname, 'src', 'index.html'));
   win.webContents.once('did-finish-load', () => {
@@ -131,7 +137,8 @@ const item = (label, action, accelerator, opts = {}) => {
   const custom = Object.prototype.hasOwnProperty.call(settings.shortcuts, action);
   commands.push({ action, label: label.replace(/…$/, ''), menu: menuPath.join(' › '), default: accelerator || '' });
   const accel = custom ? settings.shortcuts[action] || undefined : accelerator;
-  return { label, click: send(action), accelerator: accel, registerAccelerator: custom ? !!accel : !opts.page, ...opts.extra };
+  // A global shortcut (Quick Add) is registered with Windows instead of the menu.
+  return { label, click: opts.click || send(action), accelerator: accel, registerAccelerator: opts.global ? false : custom ? !!accel : !opts.page, ...opts.extra };
 };
 const pageItem = (label, action, accelerator) => item(label, action, accelerator, { page: true });
 const sub = (label, build) => { menuPath.push(label.replace(/&/g, '')); const submenu = build(); menuPath.pop(); return { label, submenu }; };
@@ -145,6 +152,7 @@ function buildMenu() {
       item('New', 'newDoc', 'Ctrl+N'),
       sub('New from Template', () => Object.entries(TEMPLATES).map(([k, l]) => item(l, 'template:' + k))),
       item('Open…', 'open', 'Ctrl+O'),
+      item('Quick Add Row (from any app)…', 'quickAdd', QUICK_DEFAULT, { global: true, click: () => openQuickAdd() }),
       { label: 'Open Recent', enabled: recent.length > 0, submenu: [
         ...recent.map(p => ({ label: p, click: () => createWindow(p) })),
         { type: 'separator' }, { label: 'Clear list', click: () => { settings.recent = []; saveSettings(); buildMenu(); } }] },
@@ -153,7 +161,9 @@ function buildMenu() {
       item('Save As…', 'saveAs', 'Ctrl+Shift+S'),
       { type: 'separator' },
       sub('Import', () => [item('OPML…', 'import:opml'), item('Markdown…', 'import:markdown'), item('Plain text…', 'import:text'), item('Rich Text (RTF)…', 'import:rtf'),
-        { type: 'separator' }, item('Word document…', 'import:docx'), item('PowerPoint presentation…', 'import:pptx')]),
+        { type: 'separator' }, item('Word document…', 'import:docx'), item('PowerPoint presentation…', 'import:pptx'),
+        item('Excel workbook…', 'import:xlsx'), item('CSV spreadsheet…', 'import:csv'),
+        { type: 'separator' }, item('OmniOutliner document…', 'import:omni'), item('OmniOutliner document folder…', 'import:omnifolder')]),
       sub('Export', () => [item('OPML…', 'export:opml'), item('Markdown…', 'export:markdown'), item('Plain text…', 'export:text'), item('Rich Text (RTF)…', 'export:rtf'),
         { type: 'separator' },
         item('Excel workbook…', 'export:xlsx'), item('Word document…', 'export:docx'), item('PowerPoint presentation…', 'export:pptx'),
@@ -189,7 +199,7 @@ function buildMenu() {
       pageItem('Collapse All', 'collapseAll', 'Alt+Shift+Left'), pageItem('Expand All', 'expandAll', 'Alt+Shift+Right'),
       { type: 'separator' },
       pageItem('Focus on Selection', 'focus', 'Ctrl+Shift+F'), item('Show Entire Outline', 'unfocus'),
-      item('Edit Filter…', 'filterEditor', 'Ctrl+Shift+G'), item('Clear Filter', 'clearFilter'),
+      item('Edit Filter…', 'filterEditor', 'Ctrl+Shift+G'), item('Show Rows That Are Due', 'showDue'), item('Clear Filter', 'clearFilter'),
       { type: 'separator' },
       sub('Add Column', () => [['Text', 'text'], ['Number', 'number'], ['Duration', 'duration'], ['Date', 'date'], ['Checkbox', 'checkbox'], ['Pop-up list', 'popup']]
         .map(([l, t]) => item(l, 'addColumn:' + t))),
@@ -208,6 +218,7 @@ function buildMenu() {
       { type: 'separator' },
       item('Folded Editing', 'toggleFolded', 'Ctrl+Shift+E'),
       item('Typewriter Scrolling', 'toggleTypewriter', 'Ctrl+Shift+T'),
+      item('Due Date Reminders', 'toggleReminders'),
       pageItem('Distraction-Free Mode', 'toggleZen', 'Ctrl+Shift+D'),
       { role: 'togglefullscreen' },
       { type: 'separator' },
@@ -282,11 +293,16 @@ ipcMain.on('set-dirty', (e, d) => { const s = S(e); if (s) s.dirty = d; });
 ipcMain.on('set-path', (e, p) => { const s = S(e); if (s) { s.path = p; if (p) addRecent(p); rememberOpen(); } });
 ipcMain.on('full-screen', (e, on) => W(e)?.setFullScreen(!!on));
 ipcMain.handle('open-dialog', async (e, kind) => {
-  const r = await dialog.showOpenDialog(W(e), { properties: ['openFile'], filters: FILTERS[kind] || FILTERS.all });
+  const r = kind === 'omnifolder'
+    ? await dialog.showOpenDialog(W(e), { title: 'Choose the OmniOutliner document folder (it ends in .ooutline or .oo3)', properties: ['openDirectory'] })
+    : await dialog.showOpenDialog(W(e), { properties: ['openFile'], filters: FILTERS[kind] || FILTERS.all });
   if (r.canceled || !r.filePaths.length) return null;
   const p = r.filePaths[0];
   if (/\.(arbor|opml)$/i.test(p)) addRecent(p);
-  return { path: p, content: readDoc(p) };
+  try { return { path: p, content: readDoc(p) }; }
+  catch (err) { dialog.showErrorBox('Could not open it', `${p}
+
+${err.code === 'ENOENT' ? 'There is no outline (contents.xml) in this folder.' : err.message}`); return null; }
 });
 ipcMain.handle('save-dialog', async (e, name, kind) => {
   const s = S(e);
@@ -320,10 +336,10 @@ ipcMain.on('open-in-new-window', (_e, p) => createWindow(p));
 ipcMain.on('close-window', e => { const s = S(e); if (s) { s.force = true; s.win.close(); } });
 
 // Keyboard shortcuts the person changed (Help > Keyboard Shortcuts).
-ipcMain.handle('get-shortcuts', () => ({ commands, overrides: settings.shortcuts }));
+ipcMain.handle('get-shortcuts', () => ({ commands, overrides: settings.shortcuts, quickError }));
 ipcMain.handle('set-shortcuts', (_e, overrides) => {
   settings.shortcuts = Object.fromEntries(Object.entries(overrides || {}).filter(([k, v]) => typeof k === 'string' && typeof v === 'string'));
-  saveSettings(); buildMenu();
+  saveSettings(); buildMenu(); registerQuickAdd();
   for (const s of wins.values()) s.win.webContents.send('shortcuts', settings.shortcuts);
   return true;
 });
@@ -347,6 +363,77 @@ ipcMain.handle('save-recording', async (e, docPath, name, bytes) => {
   return p;
 });
 
+ipcMain.on('focus-window', e => { const w = W(e); if (w) { if (w.isMinimized()) w.restore(); w.show(); w.focus(); } });
+
+// ---------------------------------------------------------------- quick add from any app
+// A small box opened by a global shortcut; the row goes to an open outline, or straight into a recent outline file.
+const QUICK_DEFAULT = 'Ctrl+Alt+Space';
+let quickWin = null, quickError = '';
+function registerQuickAdd() {
+  if (SMOKE) return; // the tests must not take the person's keys
+  globalShortcut.unregisterAll();
+  const accel = Object.prototype.hasOwnProperty.call(settings.shortcuts, 'quickAdd') ? settings.shortcuts.quickAdd : QUICK_DEFAULT;
+  quickError = '';
+  if (!accel) return;
+  try { if (!globalShortcut.register(accel, openQuickAdd)) quickError = `${accel} is used by another app, so Quick Add has no shortcut. Choose another one.`; }
+  catch (err) { quickError = `Quick Add could not use ${accel}: ${err.message}`; }
+}
+const keyFor = s => s.path ? 'file:' + path.resolve(s.path).toLowerCase() : 'win:' + s.win.webContents.id;
+const nameOf = p => path.basename(p).replace(/\.[^.]+$/, '');
+function quickTargets() {
+  const out = [], seen = new Set();
+  for (const s of [...wins.values()].sort((a, b) => b.focusedAt - a.focusedAt)) {
+    const key = keyFor(s); if (seen.has(key)) continue; seen.add(key);
+    out.push({ key, label: s.path ? nameOf(s.path) : s.win.getTitle().replace(/^• /, '').replace(/ - Arbor Outliner$/, '') + ' (not saved)' });
+  }
+  for (const p of settings.recent) {
+    if (!/\.(arbor|opml)$/i.test(p) || !fs.existsSync(p)) continue;
+    const key = 'file:' + path.resolve(p).toLowerCase(); if (seen.has(key)) continue; seen.add(key);
+    out.push({ key, label: nameOf(p), path: p });
+  }
+  return out;
+}
+function openQuickAdd() {
+  if (quickWin && !quickWin.isDestroyed()) { quickWin.show(); quickWin.focus(); return quickWin; }
+  const { workArea } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  quickWin = new BrowserWindow({
+    width: 560, height: 132, x: Math.round(workArea.x + (workArea.width - 560) / 2), y: Math.round(workArea.y + workArea.height * 0.22),
+    frame: false, resizable: false, alwaysOnTop: true, skipTaskbar: true, show: false, title: 'Quick Add',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#26282c' : '#ffffff', icon: path.join(__dirname, 'assets', 'icon.png'),
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true, spellcheck: true },
+  });
+  quickWin.loadFile(path.join(__dirname, 'src', 'quick.html'));
+  quickWin.once('ready-to-show', () => { quickWin.show(); quickWin.focus(); });
+  quickWin.on('blur', () => { if (!SMOKE && quickWin) quickWin.close(); }); // clicking elsewhere puts it away
+  quickWin.on('closed', () => { quickWin = null; });
+  return quickWin;
+}
+async function addQuickRow(text, key) {
+  const targets = quickTargets(), t = targets.find(x => x.key === key) || targets[0];
+  if (!t) { const w = createWindow(); w.webContents.once('did-finish-load', () => w.webContents.send('quick-add', text)); return 'a new outline'; }
+  settings.quickTarget = t.key; saveSettings();
+  const open = [...wins.values()].sort((a, b) => b.focusedAt - a.focusedAt).find(s => keyFor(s) === t.key);
+  if (open) { open.win.webContents.send('quick-add', text); return t.label; }
+  // Not open: add the row to the end of the file itself.
+  const M = require('./src/model.js'), opml = /\.opml$/i.test(t.path);
+  const raw = await fs.promises.readFile(t.path, 'utf8');
+  const doc = opml ? M.fromOPML(raw) : M.normalize(JSON.parse(raw));
+  const only = doc.root.children.length === 1 && !doc.root.children[0].text && !doc.root.children[0].children.length;
+  if (only) doc.root.children = [];
+  doc.root.children.push(M.row(text));
+  const tmp = t.path + '.saving';
+  await fs.promises.writeFile(tmp, opml ? M.toOPML(doc) : JSON.stringify(doc, null, 1), 'utf8');
+  await fs.promises.rename(tmp, t.path);
+  return t.label;
+}
+ipcMain.handle('quick-info', () => ({ targets: quickTargets().map(({ key, label }) => ({ key, label })), last: settings.quickTarget, error: quickError,
+  accel: Object.prototype.hasOwnProperty.call(settings.shortcuts, 'quickAdd') ? settings.shortcuts.quickAdd : QUICK_DEFAULT }));
+ipcMain.handle('quick-submit', async (_e, text, key) => {
+  try { return { ok: true, label: await addQuickRow(String(text), key) }; }
+  catch (err) { return { ok: false, error: err.message }; }
+});
+ipcMain.on('quick-close', () => { if (quickWin) quickWin.close(); });
+
 // ---------------------------------------------------------------- start-up
 function openLink(url) {
   try {
@@ -369,18 +456,21 @@ else {
   app.on('second-instance', (_e, argv) => {
     if (!handleArgs(argv.slice(1))) { const w = BrowserWindow.getAllWindows()[0]; if (w) { if (w.isMinimized()) w.restore(); w.focus(); } else createWindow(); }
   });
+  if (process.platform === 'win32') app.setAppUserModelId('io.github.c0linzeal.arbor-outliner'); // needed for reminder notifications
   app.whenReady().then(() => {
     if (PROBE) return updateProbe();
     loadSettings();
     buildMenu();
     if (app.isPackaged) app.setAsDefaultProtocolClient('arbor');
-    if (SMOKE) { require('./test/smoke')({ createWindow, app, wins }); return; }
+    if (SMOKE) { require('./test/smoke')({ createWindow, app, wins, openQuickAdd }); return; }
     if (!handleArgs(process.argv.slice(1))) {
       const reopen = (settings.open || []).filter(p => fs.existsSync(p));
       if (reopen.length) reopen.forEach(p => createWindow(p)); else createWindow();
     }
     setupUpdates();
+    registerQuickAdd();
   });
+  app.on('will-quit', () => globalShortcut.unregisterAll());
   app.on('before-quit', () => { quitting = true; rememberOpenOnQuit(); });
   app.on('window-all-closed', () => app.quit());
 }

@@ -329,14 +329,21 @@
       const start = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
       entries[name] = { method, data: b.subarray(start, start + size) };
     }
-    return async name => {
+    const bytesOf = async name => {
       const e = entries[name.replace(/^\//, '')];
       if (!e) return null;
-      if (e.method === 0) return dec.decode(e.data);
+      if (e.method === 0) return e.data;
       if (e.method !== 8) throw new Error('The file uses a kind of compression Arbor cannot read.');
-      return new Response(new Blob([e.data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+      return inflate(e.data, 'deflate-raw');
     };
+    const read = async name => { const b = await bytesOf(name); return b ? dec.decode(b) : null; };
+    read.bytes = bytesOf; read.names = Object.keys(entries);
+    return read;
   }
+  const inflate = async (data, format) => new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream(format))).arrayBuffer());
+  const isZip = b => b.length > 4 && b[0] === 0x50 && b[1] === 0x4b && b[2] === 3 && b[3] === 4;
+  const isGzip = b => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b;
+  const asBytes = x => typeof x === 'string' ? new TextEncoder().encode(x) : x instanceof Uint8Array ? x : new Uint8Array(x);
   // A small XML reader: elements are { name, attrs, kids }, text is a string.
   const unXml = s => s.replace(/&(#x[0-9a-f]+|#\d+|lt|gt|quot|apos|amp);/gi, (_, e) => {
     const k = e.toLowerCase();
@@ -344,7 +351,7 @@
   });
   function parseXml(xml) {
     const root = { name: '#root', attrs: {}, kids: [] }, stack = [root];
-    const re = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[([\s\S]*?)\]\]>|<(\/?)([\w:.-]+)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>|([^<]+)/g;
+    const re = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!DOCTYPE[^>[]*(?:\[[\s\S]*?\])?\s*>|<!\[CDATA\[([\s\S]*?)\]\]>|<(\/?)([\w:.-]+)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>|([^<]+)/g;
     let m;
     while ((m = re.exec(xml || ''))) {
       const top = stack[stack.length - 1];
@@ -404,8 +411,23 @@
     }
     doc.statusVisible = items.some(i => i.boxed);
     for (const c of doc.columns) { const ty = M.guessType(M.allRows(doc).map(r => r.values[c.id] || '')); if (ty !== 'text') M.convertColumn(doc, c, ty); }
+    inferSummaries(doc);
     if (!doc.root.children.length) doc.root.children.push(M.row(''));
     return doc;
+  }
+  // Exports write a parent row's total (or latest date...) as a plain value. When every parent's value
+  // is exactly that summary of its rows, turn the column's summary back on instead.
+  function inferSummaries(doc) {
+    const parents = M.allRows(doc).filter(r => r.children.length);
+    for (const c of doc.columns) {
+      const tries = { number: ['sum', 'max', 'min', 'avg'], duration: ['sum', 'max', 'min', 'avg'], date: ['max', 'min'] }[c.type];
+      if (!tries || !parents.some(p => p.values[c.id] !== undefined)) continue;
+      const own = new Map(parents.map(p => [p, p.values[c.id]]));
+      parents.forEach(p => { delete p.values[c.id]; });
+      const fit = tries.find(s => { c.summary = s; return parents.every(p => { const v = own.get(p), sv = M.cellValue(doc, p, c).value; return v === undefined ? sv === undefined : sv !== undefined && (typeof v === 'number' ? Math.abs(v - sv) < 1e-6 : v === sv); }); });
+      if (fit) c.summary = fit;
+      else { c.summary = 'none'; parents.forEach(p => { if (own.get(p) !== undefined) p.values[c.id] = own.get(p); }); }
+    }
   }
 
   // ---- Word: headings and list levels become rows; body text becomes notes ----
@@ -547,5 +569,220 @@
     return doc;
   }
 
-  return { zip, crc32, toXLSX, toDOCX, toPPTX, toRTF, fromRTF, fromDOCX, fromPPTX, unzip, parseXml };
+  // ---- OmniOutliner (.ooutline from version 5 on, .oo3 from versions 3 and 4) ----
+  // A file may be a zip (flat .ooutline, or a zipped package), gzipped XML, or plain XML.
+  const local = n => n.replace(/^[\w.-]+:/, '');
+  const textOf = n => n.kids.map(k => typeof k === 'string' ? k : '').join('');
+  const richText = n => n ? all(n, 'p').map(p => all(p, 'lit').map(textOf).join('')).join('\n').replace(/\s+$/, '') : '';
+  const isoDay = v => { // OmniOutliner dates are timestamps; keep the day as the person saw it
+    const s = String(v || '').trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const t = new Date(s);
+    if (isNaN(t)) return s;
+    const p = n => String(n).padStart(2, '0');
+    return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())}`;
+  };
+  const OO_TYPES = { text: 'text', number: 'number', date: 'date', duration: 'duration', checkbox: 'checkbox', enumeration: 'popup', popup: 'popup' };
+  const OO_SUMMARY = { sum: 'sum', total: 'sum', average: 'avg', minimum: 'min', maximum: 'max', hidden: 'hidden', none: 'none', state: 'state' };
+  async function fromOmniOutliner(input, fallbackTitle) {
+    let b = asBytes(input), password = false;
+    if (isZip(b)) {
+      const read = unzip(b);
+      const name = read.names.find(n => /(^|\/)contents\.xml$/i.test(n) && !/__MACOSX/.test(n));
+      password = !name && read.names.some(n => /encrypt/i.test(n));
+      b = name ? await read.bytes(name) : new Uint8Array(0);
+    }
+    if (isGzip(b)) b = await inflate(b, 'gzip');
+    const xml = new TextDecoder().decode(b);
+    if (!/omnigroup\.com\/namespace\/OmniOutliner/.test(xml.slice(0, 4000)))
+      throw new Error(password ? 'This OmniOutliner document is password-protected. Remove the password in OmniOutliner, then open it again.'
+        : 'Arbor could not find an outline in this file. If it is password-protected, remove the password in OmniOutliner first.');
+    const tree = parseXml(xml);
+    (function strip(n) { for (const k of els(n)) { k.name = local(k.name); strip(k); } })(tree);
+    const outline = first(tree, 'outline');
+    const colsEl = els(outline).find(k => k.name === 'columns');
+    const ids = colsEl ? colsEl.attrs : {};
+    const cols = els(colsEl).filter(k => k.name === 'column').map((c, i) => ({
+      id: c.attrs.id || ':' + i, type: c.attrs.type || 'text', summary: c.attrs.summary,
+      title: richText(els(c).find(k => k.name === 'title')).trim(),
+      outline: c.attrs['is-outline-column'] === 'yes' || c.attrs.id === ids['outline-column'],
+      note: c.attrs['is-note-column'] === 'yes' || c.attrs.id === ids['note-column'],
+      status: !!ids['status-column'] && c.attrs.id === ids['status-column'],
+      members: Object.fromEntries(all(c, 'member').map(m => [m.attrs.id, richText(m) || m.attrs.name || m.attrs.title || ''])),
+    }));
+    if (!cols.some(c => c.outline)) { const t = cols.find(c => !c.note && !c.status && c.type === 'text'); if (t) t.outline = true; }
+    const doc = M.newDoc(richText(els(outline).find(k => k.name === 'outline-title')).trim() || fallbackTitle || 'Untitled');
+    doc.root.children = [];
+    const extra = new Map(); // OmniOutliner column -> Arbor column
+    for (const c of cols) {
+      if (c.outline || c.note || c.status) continue;
+      const ac = M.column(c.title || 'Column', OO_TYPES[c.type] || 'text', { summary: OO_SUMMARY[c.summary] || 'none' });
+      if (!M.SUMMARIES[ac.type].includes(ac.summary)) ac.summary = 'none';
+      ac.options = Object.values(c.members).filter(Boolean);
+      doc.columns.push(ac); extra.set(c, ac);
+    }
+    const cell = (el, c) => { // one cell's value, as Arbor stores it
+      if (!el || el.name === 'null' || (el.name === 'entry' && !els(el).length)) return undefined;
+      if (el.name === 'entry') el = els(el)[0];
+      const idref = el.attrs.idref;
+      if (idref !== undefined) return c.members[idref] || undefined;
+      const t = el.name === 'text' ? richText(el) : textOf(el).trim();
+      if (t === '') return undefined;
+      const ac = extra.get(c);
+      if (!ac) return t;
+      if (ac.type === 'date') return isoDay(t);
+      if (ac.type === 'checkbox') return t === 'checked';
+      if (ac.type === 'duration' && /^-?\d+(\.\d+)?$/.test(t)) return Math.round(+t / 3600 * 1000) / 1000; // stored in seconds
+      return M.parseValue(ac, t);
+    };
+    let anyState = false;
+    const fill = (r, values, state) => { // values: cell elements in column order
+      cols.forEach((c, i) => {
+        const v = values[i];
+        if (c.outline) r.text = v ? (v.name === 'text' ? richText(v) : textOf(v).trim()) : '';
+        else if (c.note) { const n = v ? richText(v.name === 'entry' ? els(v)[0] : v) : ''; if (n) r.note = n; }
+        else if (c.status) state = v ? textOf(v).trim() : state;
+        else { const x = cell(v, c); if (x !== undefined) r.values[extra.get(c).id] = x; }
+      });
+      if (state === 'checked' || state === 'indeterminate') anyState = true;
+      r.state = state === 'checked';
+    };
+    const items = els(outline).find(k => k.name === 'items');
+    if (items) {
+      // Version 5: a flat list; each item names its parent and its place among its siblings (rank).
+      const list = els(items).filter(k => k.name === 'item');
+      const rootItem = list.find(k => k.attrs['is-root'] === 'yes');
+      const kids = new Map(), rows = new Map();
+      for (const it of list) {
+        if (it === rootItem) continue;
+        const r = M.row('');
+        fill(r, els(it).filter(k => k.name !== 'style'), 'unchecked');
+        rows.set(it.attrs.id, r);
+        const parent = it.attrs['parent-id'] && it.attrs['parent-id'] !== (rootItem && rootItem.attrs.id) ? it.attrs['parent-id'] : '';
+        if (!kids.has(parent)) kids.set(parent, []);
+        kids.get(parent).push({ rank: it.attrs.rank || '', row: r });
+      }
+      const order = (a, b) => a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0;
+      for (const [pid, list2] of kids) {
+        const parent = pid ? rows.get(pid) : doc.root;
+        (parent || doc.root).children.push(...list2.sort(order).map(x => x.row));
+      }
+    } else {
+      // Versions 3 and 4: items nest inside each other; the note is separate from the columns.
+      const valueCols = cols.filter(c => !c.note);
+      const build = it => {
+        const r = M.row('');
+        const vals = els(els(it).find(k => k.name === 'values'));
+        const byCol = cols.map(c => c.note ? null : vals[valueCols.indexOf(c)]);
+        fill(r, byCol, it.attrs.state || 'unchecked');
+        const note = els(it).find(k => k.name === 'note');
+        if (note) r.note = richText(note);
+        r.collapsed = it.attrs.expanded === 'no' ? true : it.attrs.expanded === 'yes' ? false : els(it).some(k => k.name === 'children');
+        r.children = els(els(it).find(k => k.name === 'children')).filter(k => k.name === 'item').map(build);
+        if (!r.children.length) r.collapsed = false;
+        return r;
+      };
+      const rootEl = els(outline).find(k => k.name === 'root');
+      doc.root.children = els(rootEl).filter(k => k.name === 'item').map(build);
+    }
+    doc.statusVisible = anyState;
+    if (!doc.root.children.length) doc.root.children.push(M.row(''));
+    return doc;
+  }
+
+  // ---- spreadsheets (Excel and CSV): a row per line; Level, Status and Note columns are understood ----
+  function fromTable(table, title, levels) {
+    const at = table.findIndex(r => r.some(v => v !== '' && v != null));
+    if (at < 0) return assemble([], title, []);
+    const head = table[at].map(v => String(v == null ? '' : v).trim()), body = table.slice(at + 1), lv = levels ? levels.slice(at + 1) : null;
+    const str = v => v == null ? '' : typeof v === 'boolean' ? (v ? 'checked' : 'unchecked') : String(v).trim();
+    const colVals = i => body.map(r => str(r[i])).filter(Boolean);
+    const named = re => head.findIndex(n => re.test(n));
+    let level = named(/^(level|depth|outline level)$/i);
+    if (level >= 0 && !colVals(level).every(v => /^\d+$/.test(v) && +v >= 1)) level = -1;
+    let status = named(/^(status|done|checked|complete)$/i);
+    if (status >= 0 && !colVals(status).every(v => /^(checked|unchecked|mixed|yes|no|true|false|x|done|)$/i.test(v))) status = -1;
+    const note = named(/^notes?$/i);
+    let topic = named(/^(topic|title|task|item|name|row)$/i);
+    if (topic < 0) topic = head.findIndex((_, i) => ![level, status, note].includes(i));
+    if (topic < 0) topic = 0;
+    const columns = [], colOf = new Map();
+    head.forEach((n, i) => { if (![level, status, note, topic].includes(i)) { const c = M.column(n || 'Column ' + (i + 1), 'text'); columns.push(c); colOf.set(i, c); } });
+    const items = [];
+    body.forEach((r, k) => {
+      if (!r.some(v => str(v) !== '')) return;
+      const values = {};
+      for (const [i, c] of colOf) { const v = str(r[i]); if (v) values[c.id] = v; }
+      const st = status >= 0 ? str(r[status]).toLowerCase() : '';
+      items.push({ key: level >= 0 ? +str(r[level]) || 1 : lv ? lv[k] || 0 : 0, text: str(r[topic]), values,
+        boxed: status >= 0, checked: /^(checked|yes|true|x|done)$/.test(st) });
+      if (note >= 0 && str(r[note])) items.push({ kind: 'note', text: str(r[note]) });
+    });
+    return assemble(items, title, columns);
+  }
+  function parseCSV(text) {
+    text = String(text).replace(/^﻿/, '');
+    const firstLine = text.split(/\r?\n/, 1)[0];
+    const delim = [',', ';', '\t'].map(d => [d, firstLine.split(d).length]).sort((a, b) => b[1] - a[1])[0][0];
+    const rows = []; let row = [], field = '', q = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (q) {
+        if (ch === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; }
+        else field += ch;
+      } else if (ch === '"' && field === '') q = true;
+      else if (ch === delim) { row.push(field); field = ''; }
+      else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(field); rows.push(row); row = []; field = ''; }
+      else field += ch;
+    }
+    if (field !== '' || row.length) { row.push(field); rows.push(row); }
+    return rows;
+  }
+  const fromCSV = (text, title) => fromTable(parseCSV(text), title);
+
+  async function fromXLSX(bytes, title) {
+    const read = unzip(asBytes(bytes));
+    const parse = async name => { const t = parseXml(await read(name)); (function strip(n) { for (const k of els(n)) { k.name = local(k.name); strip(k); } })(t); return t; };
+    const wb = await parse('xl/workbook.xml');
+    const sheet = first(wb, 'sheet');
+    if (!sheet) throw new Error('The workbook has no sheets in it.');
+    const target = (readRels(await read('xl/_rels/workbook.xml.rels'), 'xl/')[sheet.attrs['r:id']] || {}).target || 'xl/worksheets/sheet1.xml';
+    const shared = all(await parse('xl/sharedStrings.xml'), 'si').map(si => {
+      const out = [];
+      const walk = n => { for (const k of els(n)) { if (k.name === 't') out.push(textOf(k)); else if (k.name !== 'rPh' && k.name !== 'phoneticPr') walk(k); } };
+      walk(si); return out.join('');
+    });
+    // Which cell styles are dates, and how far each indents (Arbor's own export indents the topic by level)
+    const styles = await parse('xl/styles.xml');
+    const custom = Object.fromEntries(all(styles, 'numFmt').map(f => [f.attrs.numFmtId, f.attrs.formatCode || '']));
+    const isDateFmt = id => (id >= 14 && id <= 22) || (id >= 27 && id <= 36) || (id >= 45 && id <= 47) || (id >= 50 && id <= 58) ||
+      (custom[id] !== undefined && /[dmy]/i.test(custom[id].replace(/"[^"]*"|\[[^\]]*\]|\\./g, '')) && !/^[hms:.\s0#,]*$/i.test(custom[id]));
+    const xfs = els(first(styles, 'cellXfs')).filter(k => k.name === 'xf').map(xf => ({ date: isDateFmt(+xf.attrs.numFmtId), indent: +(val(first(xf, 'alignment'), 'indent') || 0) }));
+    const colNum = ref => { let n = 0; for (const ch of (/^[A-Z]+/.exec(ref) || [''])[0]) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+    const table = [], outline = [], indent = [];
+    for (const row of all(await parse(target), 'row')) {
+      const ri = row.attrs.r ? +row.attrs.r - 1 : table.length;
+      const cells = []; let next = 0, ind = 0;
+      for (const c of els(row).filter(k => k.name === 'c')) {
+        const ci = c.attrs.r ? colNum(c.attrs.r) : next; next = ci + 1;
+        const v = els(c).find(k => k.name === 'v'), t = c.attrs.t, xf = xfs[+c.attrs.s || 0] || {};
+        let x = v ? textOf(v) : '';
+        if (t === 's') x = shared[+x] || '';
+        else if (t === 'inlineStr') x = all(c, 't').map(textOf).join('');
+        else if (t === 'b') x = x === '1';
+        else if (t !== 'str' && t !== 'e' && x !== '') {
+          const n = +x;
+          x = xf.date && !isNaN(n) ? new Date(Date.UTC(1899, 11, 30) + Math.round(n * 864e5)).toISOString().slice(0, 10) : n;
+        }
+        if (ci === 0) ind = xf.indent;
+        cells[ci] = x;
+      }
+      table[ri] = cells; outline[ri] = +(row.attrs.outlineLevel || 0); indent[ri] = ind;
+    }
+    for (let i = 0; i < table.length; i++) if (!table[i]) { table[i] = []; outline[i] = 0; indent[i] = 0; }
+    const levels = indent.some(Boolean) ? indent : outline.some(Boolean) ? outline : null;
+    return fromTable(table, title, levels);
+  }
+
+  return { zip, crc32, toXLSX, toDOCX, toPPTX, toRTF, fromRTF, fromDOCX, fromPPTX, fromOmniOutliner, fromXLSX, fromCSV, parseCSV, unzip, parseXml };
 });

@@ -23,11 +23,11 @@ function h(tag, props = {}, ...kids) {
 
 const state = {
   doc: M.newDoc(), path: null, dirty: false, pristine: true, version: 0,
-  sel: new Set(), anchor: null, head: null, focusIds: [], filter: { text: '', status: 'all', rules: [] },
+  sel: new Set(), anchor: null, head: null, focusIds: [], filter: { text: '', status: 'all', rules: [], due: false },
   undo: [], redo: [], editing: false, pendingFocus: null, noteOpen: new Set(), clip: null, drag: null,
   sidebar: true, inspector: true, zen: false, inspectorTab: 'document', flashCol: null,
   find: { idx: -1, matches: [] },
-  folded: pref('folded', false), typewriter: pref('typewriter', false),
+  folded: pref('folded', false), typewriter: pref('typewriter', false), reminders: pref('reminders', true),
   recording: null, mirrored: false, shortcuts: {},
 };
 // Per-person view settings kept between sessions.
@@ -153,8 +153,8 @@ function render() { applyTheme(); renderOutline(); renderSidebar(); renderInspec
 const visibleCols = () => state.doc.columns.filter(c => !c.hidden);
 const gridTemplate = cols => ['minmax(180px, 1fr)'].concat(cols.map(c => c.width + 'px')).join(' ');
 const activeRules = () => (state.filter.rules || []).filter(r => state.doc.columns.some(c => c.id === r.col));
-const filtering = () => !!state.filter.text.trim() || state.filter.status !== 'all' || activeRules().length > 0;
-const visibleOpts = () => ({ focusIds: state.focusIds, text: state.filter.text, status: state.filter.status, rules: state.filter.rules });
+const filtering = () => !!state.filter.text.trim() || state.filter.status !== 'all' || activeRules().length > 0 || !!state.filter.due;
+const visibleOpts = () => ({ focusIds: state.focusIds, text: state.filter.text, status: state.filter.status, rules: state.filter.rules, due: state.filter.due });
 
 function renderOutline() {
   const d = state.doc;
@@ -284,7 +284,9 @@ function cellEl(r, col) {
   }
   if (cv.computed) { cell.textContent = M.formatValue(col, cv.value); cell.title = SUMMARY_NAMES[col.summary] + ' of the rows inside'; return cell; }
   if (col.type === 'date') {
-    cell.append(h('input', { type: 'date', class: cv.value ? '' : 'empty', value: cv.value || '', onchange: e => commit(e.target.value || undefined) }));
+    const today = M.isoToday(), when = col.remind && cv.value && M.statusOf(r) !== 'checked' ? (cv.value < today ? ' overdue' : cv.value === today ? ' today' : '') : '';
+    cell.append(h('input', { type: 'date', class: (cv.value ? '' : 'empty') + when, title: when === ' overdue' ? 'Overdue' : when ? 'Due today' : null,
+      value: cv.value || '', onchange: e => commit(e.target.value || undefined) }));
   } else if (col.type === 'popup') {
     const opts = col.options.slice();
     if (cv.value && !opts.includes(cv.value)) opts.push(cv.value);
@@ -368,10 +370,15 @@ function renderSidebar() {
   const results = findResultsEl();
   if (results) kids.unshift(...results);
   kids.push(h('h4', {}, 'Filters'));
-  const noRules = !activeRules().length;
+  const noRules = !activeRules().length && !f.due;
   for (const [v, l] of [['all', 'All rows'], ['unchecked', 'Unchecked'], ['checked', 'Checked']]) kids.push(item(l, !f.text && noRules && f.status === v, () => setFilter('', v)));
-  const sameRules = sf => JSON.stringify(sf.rules || []) === JSON.stringify(f.rules || []);
-  d.filters.forEach((sf, i) => kids.push(item(sf.name, f.text === sf.text && f.status === sf.status && sameRules(sf), () => setFilter(sf.text, sf.status, sf.rules || []), '',
+  if (M.remindColumns(d).length) {
+    const n = M.dueRows(d).length;
+    kids.push(item('Due or overdue', !!f.due && !f.text && !activeRules().length && f.status === 'all', () => setFilter('', 'all', [], true), '',
+      n ? h('span', { class: 'count' }, String(n)) : null));
+  }
+  const sameRules = sf => JSON.stringify(sf.rules || []) === JSON.stringify(f.rules || []) && !!sf.due === !!f.due;
+  d.filters.forEach((sf, i) => kids.push(item(sf.name, f.text === sf.text && f.status === sf.status && sameRules(sf), () => setFilter(sf.text, sf.status, sf.rules || [], !!sf.due), '',
     h('span', { class: 'acts' },
       h('span', { class: 'x', title: 'Edit this filter', onclick: e => { e.stopPropagation(); filterEditor(i); } }, '✎'),
       h('span', { class: 'x', title: 'Delete this filter', onclick: e => { e.stopPropagation(); change(dd => dd.filters.splice(i, 1)); } }, '✕')))));
@@ -379,7 +386,7 @@ function renderSidebar() {
     const inp = h('input', { placeholder: 'Name this filter' });
     kids.push(h('div', { class: 'save-filter' }, inp, h('button', { onclick: () => {
       const name = inp.value.trim() || describeFilter(f);
-      change(dd => dd.filters.push({ name, text: f.text, status: f.status, rules: JSON.parse(JSON.stringify(f.rules || [])) }));
+      change(dd => dd.filters.push({ name, text: f.text, status: f.status, rules: JSON.parse(JSON.stringify(f.rules || [])), due: !!f.due }));
     } }, 'Save')));
   }
   kids.push(h('div', { class: 'item more', onclick: () => filterEditor() }, h('span', {}, '+ Filter by column…')));
@@ -398,14 +405,15 @@ function focusOn(id, add) {
 }
 const focusRows = () => state.focusIds.map(id => M.find(state.doc, id)).filter(Boolean).map(f => f.row);
 const focusRoot = d => { const f = state.focusIds[0] && M.find(d, state.focusIds[0]); return f ? f.row : d.root; };
-function setFilter(text, status, rules = []) {
-  state.filter = { text, status, rules }; $('#filter').value = text; $('#statusFilter').value = status;
+function setFilter(text, status, rules = [], due = false) {
+  state.filter = { text, status, rules, due }; $('#filter').value = text; $('#statusFilter').value = status;
   renderOutline(); renderSidebar(); renderStatus();
 }
 function describeFilter(f) {
   const parts = [];
   if (f.text) parts.push(`"${f.text}"`);
   if (f.status !== 'all') parts.push(f.status === 'checked' ? 'Checked' : 'Unchecked');
+  if (f.due) parts.push('Due or overdue');
   for (const r of f.rules || []) {
     const c = state.doc.columns.find(x => x.id === r.col); if (!c) continue;
     const op = M.RULE_OPS[c.type].find(o => o[0] === r.op);
@@ -423,6 +431,7 @@ function filterEditor(savedIndex) {
   const name = h('input', { value: saved ? saved.name : '', placeholder: 'Name (to save it in the sidebar)' });
   const text = h('input', { value: f.text || '', placeholder: 'Rows containing this text' });
   const status = pick(f.status || 'all', [['all', 'Any'], ['unchecked', 'Unchecked'], ['checked', 'Checked']], v => { f.status = v; });
+  const due = M.remindColumns(d).length ? tick(f.due, v => { f.due = v; }, 'Only rows that are due or overdue') : null;
   const list = h('div', { class: 'rules' });
   const drawRules = () => list.replaceChildren(...f.rules.map((r, i) => {
     const col = d.columns.find(c => c.id === r.col) || d.columns[0];
@@ -445,11 +454,12 @@ function filterEditor(savedIndex) {
       h('button', { title: 'Remove this condition', onclick: () => { f.rules.splice(i, 1); drawRules(); } }, '✕'));
   }));
   drawRules();
-  const read = () => ({ text: text.value, status: f.status || 'all', rules: f.rules.filter(r => d.columns.some(c => c.id === r.col)) });
+  const read = () => ({ text: text.value, status: f.status || 'all', rules: f.rules.filter(r => d.columns.some(c => c.id === r.col)), due: !!f.due });
   openModal(h('h3', {}, saved ? 'Edit filter' : 'Filter'),
     h('div', { class: 'form' },
       h('label', {}, 'Text'), text,
       h('label', {}, 'Checkbox'), status,
+      due ? h('label', {}, 'Due') : null, due,
       h('label', {}, 'Columns'), h('div', {}, list,
         d.columns.length ? h('button', { onclick: () => { f.rules.push({ col: d.columns[0].id, op: M.RULE_OPS[d.columns[0].type][0][0], value: '' }); drawRules(); } }, '+ Add condition')
           : h('span', { class: 'hint' }, 'Add a column to the outline to filter by its values.')),
@@ -463,7 +473,7 @@ function filterEditor(savedIndex) {
         const nf = read(), nm = name.value.trim();
         if (saved) change(dd => { dd.filters[savedIndex] = { name: nm || describeFilter(nf), ...nf }; });
         else if (nm) change(dd => dd.filters.push({ name: nm, ...nf }));
-        closeModal(); setFilter(nf.text, nf.status, nf.rules);
+        closeModal(); setFilter(nf.text, nf.status, nf.rules, nf.due);
       } }, saved ? 'Save' : name.value ? 'Save and show' : 'Show'),
     ));
   name.addEventListener('input', () => { const b = $('#modal .actions button:last-child'); if (!saved) b.textContent = name.value.trim() ? 'Save and show' : 'Show'; });
@@ -586,6 +596,7 @@ function columnsPane() {
         onchange: e => change(dd => { dd.columns[i].options = e.target.value.split('\n').map(s => s.trim()).filter(Boolean); }) })) : null,
       field('Width', h('input', { type: 'number', min: 50, max: 800, value: c.width, onchange: e => change(dd => { dd.columns[i].width = Math.max(50, +e.target.value || 120); }) })),
       field('', tick(c.hidden, v => change(dd => { dd.columns[i].hidden = v; }), 'Hidden')),
+      c.type === 'date' ? field('', tick(c.remind, v => change(dd => { dd.columns[i].remind = v; }), 'Remind me when rows are due')) : null,
       h('div', { class: 'btns' },
         sortBtns(c.id),
         h('button', { title: 'Move left', disabled: i === 0, onclick: () => change(dd => { const a = dd.columns; [a[i - 1], a[i]] = [a[i], a[i - 1]]; }) }, '←'),
@@ -668,11 +679,12 @@ async function save(as = false) {
   return true;
 }
 function setDoc(doc, path) {
-  Object.assign(state, { doc, path, undo: [], redo: [], sel: new Set(), focusIds: [], filter: { text: '', status: 'all', rules: [] },
+  Object.assign(state, { doc, path, undo: [], redo: [], sel: new Set(), focusIds: [], filter: { text: '', status: 'all', rules: [], due: false },
     noteOpen: new Set(), dirty: false, pristine: !path, editing: false });
   $('#filter').value = ''; $('#statusFilter').value = 'all';
   host.setDirty(false); lastDirty = false; host.setPath(path);
   render(); focusFirst();
+  setTimeout(() => checkReminders(), 2500);
 }
 async function loadContent(path, content) {
   const ext = (path.split('.').pop() || '').toLowerCase(), name = baseName(path);
@@ -680,12 +692,16 @@ async function loadContent(path, content) {
   try {
     if (ext === 'docx') doc = await Office.fromDOCX(content, name);
     else if (ext === 'pptx') doc = await Office.fromPPTX(content, name);
+    else if (ext === 'xlsx') doc = await Office.fromXLSX(content, name);
+    else if (ext === 'csv') doc = Office.fromCSV(content, name);
+    else if (/^(ooutline|oo3|oo3template|otemplate|zip)$/.test(ext)) doc = await Office.fromOmniOutliner(content, name);
     else
     if (ext === 'arbor' || ext === 'json') { doc = M.normalize(JSON.parse(content)); native = true; }
     else if (ext === 'opml') { doc = M.normalize(M.fromOPML(content)); native = !importing; }
     else if (ext === 'xml') doc = M.fromOPML(content);
     else if (ext === 'md' || ext === 'markdown') doc = M.fromMarkdown(content, name);
     else if (ext === 'rtf') doc = Office.fromRTF(content, name);
+    else if (typeof content !== 'string') doc = await Office.fromOmniOutliner(content, name); // a package folder's contents.xml
     else doc = M.fromText(content, name);
   } catch (e) { alert(`Could not open ${name}.\n\n${e.message}`); return; }
   if (!doc.title || doc.title === 'Untitled') doc.title = name;
@@ -849,6 +865,32 @@ function setCollapsed(on, all) {
     else targets().forEach(id => { const r = M.find(d, id).row; if (r.children.length) r.collapsed = on; });
   });
 }
+// ---------------------------------------------------------------- due date reminders
+// Once a day per outline, a Windows notification lists the rows that are due or overdue.
+// Clicking it brings the window forward with the Due filter on.
+function checkReminders(force) {
+  if (!state.reminders || !window.Notification) return;
+  const due = M.dueRows(state.doc); if (!due.length) return;
+  const key = 'arbor.reminded.' + (state.path || state.doc.title), today = M.isoToday();
+  let seen = null; try { seen = localStorage.getItem(key); } catch { /* storage unavailable */ }
+  if (seen === today && !force) return;
+  try { localStorage.setItem(key, today); } catch { /* storage unavailable */ }
+  const overdue = due.filter(x => x.overdue).length, names = due.slice(0, 3).map(x => x.row.text || 'Untitled row');
+  const title = `${due.length} ${due.length === 1 ? 'row is' : 'rows are'} due in ${state.path ? baseName(state.path) : state.doc.title}`;
+  const body = (overdue ? `${overdue} overdue. ` : '') + names.join(', ') + (due.length > 3 ? `, and ${due.length - 3} more` : '');
+  const n = new Notification(title, { body });
+  n.onclick = () => { if (host.focusWindow) host.focusWindow(); setFilter('', 'all', [], true); };
+}
+setInterval(() => checkReminders(), 30 * 60 * 1000); // also catches the day changing while the outline is open
+
+// ---------------------------------------------------------------- quick add (a row added from any app)
+function quickAdd(text) {
+  const t = String(text || '').trim(); if (!t) return;
+  if (filtering()) setFilter('', 'all');
+  change(d => focusRoot(d).children.push(M.row(t)));
+  flash('Added: ' + t);
+}
+
 // ---------------------------------------------------------------- audio recording
 async function toggleRecording() {
   const rec = state.recording;
@@ -1035,6 +1077,8 @@ const cmd = {
   unmirror() { state.mirrored = false; renderStatus(); },
   markDirty() { if (!state.dirty) { state.dirty = true; host.setDirty(true); lastDirty = true; } scheduleAutosave(); renderStatus(); },
   record: () => toggleRecording(),
+  toggleReminders() { state.reminders = !state.reminders; setPref('reminders', state.reminders); flash(state.reminders ? 'Due date reminders on' : 'Due date reminders off'); if (state.reminders) checkReminders(true); },
+  showDue: () => setFilter('', 'all', [], true),
   async attachFiles() {
     const id = targets()[0]; if (!id) return flash('Select a row first');
     const ps = await host.pickFiles();
@@ -1121,6 +1165,7 @@ async function shortcutsEditor() {
   const pretty = a => a ? a.replace(/\bUp\b/, '↑').replace(/\bDown\b/, '↓').replace(/\bLeft\b/, '←').replace(/\bRight\b/, '→') : '';
   const search = h('input', { type: 'search', placeholder: 'Search commands' });
   const msg = h('div', { class: 'hint' }, 'Click a shortcut, then press the new keys. Backspace removes it; Esc cancels.');
+  if (info.quickError) { msg.textContent = info.quickError; msg.classList.add('warn'); }
   const body = h('tbody');
   let recording = null;
   const draw = () => {
@@ -1221,8 +1266,8 @@ function selectionKey(e, k) {
 document.addEventListener('click', e => { const b = e.target.closest('button[data-cmd]'); if (b) run(b.dataset.cmd); });
 // Toolbar buttons must not steal the text cursor from the row being edited.
 for (const s of ['#toolbar', '#findbar', '#focusbar']) $(s).addEventListener('mousedown', e => { if (e.target.closest('button')) e.preventDefault(); });
-$('#filter').addEventListener('input', e => setFilter(e.target.value, state.filter.status, state.filter.rules));
-$('#statusFilter').addEventListener('change', e => setFilter(state.filter.text, e.target.value, state.filter.rules));
+$('#filter').addEventListener('input', e => setFilter(e.target.value, state.filter.status, state.filter.rules, state.filter.due));
+$('#statusFilter').addEventListener('change', e => setFilter(state.filter.text, e.target.value, state.filter.rules, state.filter.due));
 $('#findText').addEventListener('input', () => { state.find.idx = -1; findGo(1); });
 $('#findCase').addEventListener('change', () => { state.find.idx = -1; findGo(1); });
 $('#modal').addEventListener('mousedown', e => { if (e.target.id === 'modal') closeModal(); });
@@ -1231,9 +1276,9 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', async e => {
   e.preventDefault();
   for (const f of e.dataTransfer.files) {
-    if (!/\.(arbor|opml|md|markdown|txt|rtf|docx|pptx)$/i.test(f.name)) continue;
+    if (!/\.(arbor|opml|md|markdown|txt|rtf|docx|pptx|xlsx|csv|ooutline|oo3)$/i.test(f.name)) continue;
     const p = host.pathForFile(f);
-    if (p && !host.web) host.openInNewWindow(p); else openContent(f.name, /\.(docx|pptx)$/i.test(f.name) ? new Uint8Array(await f.arrayBuffer()) : await f.text());
+    if (p && !host.web) host.openInNewWindow(p); else openContent(f.name, /\.(docx|pptx|xlsx|ooutline|oo3|zip)$/i.test(f.name) ? new Uint8Array(await f.arrayBuffer()) : await f.text());
   }
 });
 host.onMenu(run);
@@ -1241,16 +1286,17 @@ host.onLoad(async ({ path, content, reveal: rid }) => { await loadContent(path, 
 host.onReveal(id => { reveal(id); selectOnly(id); });
 if (host.onShortcuts) host.onShortcuts(applyShortcuts);
 if (host.onSync) host.onSync(receiveSync);
+if (host.onQuickAdd) host.onQuickAdd(quickAdd);
 if (host.onMirror) host.onMirror(m => { setDoc(M.normalize(JSON.parse(m.doc)), m.path || null); state.mirrored = true; state.pristine = false; renderStatus(); });
 render();
 focusFirst();
-window.__arbor = { state, cmd, run, M, loadContent, save, setDoc, runScript, applyShortcuts, keyName, accelToKey, keyToAccel }; // used by the automated tests
+window.__arbor = { state, cmd, run, M, loadContent, save, setDoc, runScript, applyShortcuts, keyName, accelToKey, keyToAccel, checkReminders }; // used by the automated tests
 
 // ---------------------------------------------------------------- browser fallback (the app also runs in a plain browser)
 function webShim() {
   const pickFile = accept => new Promise(res => {
     const i = document.createElement('input'); i.type = 'file'; i.accept = accept;
-    i.onchange = async () => { const f = i.files[0]; res(f ? { path: f.name, content: /\.(docx|pptx)$/i.test(f.name) ? new Uint8Array(await f.arrayBuffer()) : await f.text() } : null); };
+    i.onchange = async () => { const f = i.files[0]; res(f ? { path: f.name, content: /\.(docx|pptx|xlsx|ooutline|oo3|zip)$/i.test(f.name) ? new Uint8Array(await f.arrayBuffer()) : await f.text() } : null); };
     i.click();
   });
   const download = (name, content) => {
@@ -1261,7 +1307,7 @@ function webShim() {
   return {
     web: true, onMenu: none, onLoad: none, onReveal: none, setDirty: none, setPath: none,
     setFullScreen: on => { if (on && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(none); else if (!on && document.fullscreenElement) document.exitFullscreen(); },
-    openDialog: () => pickFile('.arbor,.opml,.md,.markdown,.txt,.json,.rtf,.docx,.pptx'),
+    openDialog: () => pickFile('.arbor,.opml,.md,.markdown,.txt,.json,.rtf,.docx,.pptx,.xlsx,.csv,.ooutline,.oo3,.zip'),
     saveDialog: async name => name, writeFile: async (p, c) => download(p, c),
     exportPDF: async () => { window.print(); return null; }, print: () => window.print(),
     openExternal: u => window.open(u, '_blank', 'noopener'), openPath: none, pathForFile: () => '',

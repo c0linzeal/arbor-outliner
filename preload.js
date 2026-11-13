@@ -29,4 +29,9 @@ contextBridge.exposeInMainWorld('api', {
   syncDoc: doc => ipcRenderer.send('sync-doc', doc),
   onSync: cb => ipcRenderer.on('sync', (_e, doc) => cb(doc)),
   saveRecording: (docPath, name, bytes) => ipcRenderer.invoke('save-recording', docPath, name, bytes),
+  focusWindow: () => ipcRenderer.send('focus-window'),
+  onQuickAdd: cb => ipcRenderer.on('quick-add', (_e, text) => cb(text)),
+  quickInfo: () => ipcRenderer.invoke('quick-info'),
+  quickSubmit: (text, key) => ipcRenderer.invoke('quick-submit', text, key),
+  quickClose: () => ipcRenderer.send('quick-close'),
 });
