@@ -5,10 +5,21 @@ const fs = require('fs');
 
 const SMOKE = process.argv.includes('--smoke');
 const PROBE = process.argv.includes('--update-probe');
-const DOC_EXT = /\.(arbor|opml|md|markdown|txt)$/i;
+// The end-to-end test records audio from Chromium's fake microphone instead of a real one.
+// It also keeps its own settings, so it never touches the real ones.
+if (SMOKE) {
+  app.commandLine.appendSwitch('use-fake-device-for-media-stream'); app.commandLine.appendSwitch('use-fake-ui-for-media-stream');
+  app.setPath('userData', path.join(require('os').tmpdir(), 'arbor-smoke-profile'));
+}
+const DOC_EXT = /\.(arbor|opml|md|markdown|txt|rtf)$/i;
 const FILTERS = {
-  all: [{ name: 'Outlines', extensions: ['arbor', 'opml', 'md', 'markdown', 'txt'] }, { name: 'All files', extensions: ['*'] }],
+  all: [{ name: 'Outlines', extensions: ['arbor', 'opml', 'md', 'markdown', 'txt', 'rtf'] }, { name: 'All files', extensions: ['*'] }],
   arbor: [{ name: 'Arbor outline', extensions: ['arbor'] }],
+  save: [{ name: 'Arbor outline', extensions: ['arbor'] }, { name: 'OPML outline (keeps rows, notes, checkboxes and columns)', extensions: ['opml'] }],
+  rtf: [{ name: 'Rich Text', extensions: ['rtf'] }],
+  xlsx: [{ name: 'Excel workbook', extensions: ['xlsx'] }],
+  docx: [{ name: 'Word document', extensions: ['docx'] }],
+  pptx: [{ name: 'PowerPoint presentation', extensions: ['pptx'] }],
   opml: [{ name: 'OPML', extensions: ['opml'] }],
   markdown: [{ name: 'Markdown', extensions: ['md', 'markdown'] }],
   md: [{ name: 'Markdown', extensions: ['md'] }],
@@ -19,8 +30,10 @@ const FILTERS = {
   pdf: [{ name: 'PDF', extensions: ['pdf'] }],
 };
 
-const wins = new Map(); // webContents id -> { win, path, dirty, force }
-let settings = { recent: [], open: [] };
+const wins = new Map(); // webContents id -> { win, path, dirty, force, group }
+let settings = { recent: [], open: [], shortcuts: {} }; // shortcuts: menu action -> accelerator ('' = none)
+let groupSeq = 0; // windows showing the same outline share a group number
+const groupPeers = s => s.group ? [...wins.values()].filter(o => o !== s && o.group === s.group) : [];
 let quitting = false;
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
 function loadSettings() { try { Object.assign(settings, JSON.parse(fs.readFileSync(settingsFile(), 'utf8'))); } catch { /* first run */ } }
@@ -40,7 +53,7 @@ function rememberOpen() {
 }
 
 function createWindow(file, extra = {}) {
-  if (file) {
+  if (file && !extra.mirror) {
     const open = [...wins.values()].find(s => s.path && samePath(s.path, file));
     if (open) { open.win.show(); open.win.focus(); if (extra.reveal) open.win.webContents.send('reveal', extra.reveal); return open.win; }
   }
@@ -53,15 +66,18 @@ function createWindow(file, extra = {}) {
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true, spellcheck: true },
   });
   const id = win.webContents.id;
-  const s = { win, path: null, dirty: false, force: false };
+  const s = { win, path: null, dirty: false, force: false, group: extra.mirror ? extra.mirror.group : 0 };
   wins.set(id, s);
   win.loadFile(path.join(__dirname, 'src', 'index.html'));
   win.webContents.once('did-finish-load', () => {
-    if (file) sendFile(win, file, extra.reveal);
+    win.webContents.send('shortcuts', settings.shortcuts);
+    if (extra.mirror) win.webContents.send('mirror', extra.mirror);
+    else if (file) sendFile(win, file, extra.reveal);
     else if (extra.template) win.webContents.send('menu', 'template:' + extra.template);
   });
   win.on('close', e => {
-    if (s.force || !s.dirty || SMOKE) return;
+    // Another window still shows this outline, so nothing is lost by closing this one.
+    if (s.force || !s.dirty || SMOKE || groupPeers(s).length) return;
     e.preventDefault();
     const r = dialog.showMessageBoxSync(win, {
       type: 'warning', buttons: ['Save', "Don't Save", 'Cancel'], defaultId: 0, cancelId: 2,
@@ -71,7 +87,13 @@ function createWindow(file, extra = {}) {
     else if (r === 1) { s.force = true; win.close(); }
     else quitting = false;
   });
-  win.on('closed', () => { wins.delete(id); rememberOpen(); });
+  win.on('closed', () => {
+    const peers = groupPeers(s);
+    wins.delete(id); rememberOpen();
+    if (peers.length === 1) { peers[0].group = 0; peers[0].win.webContents.send('menu', 'unmirror'); } // on its own again
+    // A closing window may hold the only record of unsaved changes; hand that to a peer.
+    if (s.dirty && peers.length) { peers[0].dirty = true; peers[0].win.webContents.send('menu', 'markDirty'); }
+  });
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/i.test(url)) shell.openExternal(url); return { action: 'deny' }; });
   win.webContents.on('will-navigate', e => e.preventDefault());
   win.webContents.on('context-menu', (_e, p) => contextMenu(win, p));
@@ -100,16 +122,26 @@ const send = action => () => {
   if (w) w.webContents.send('menu', action); else createWindow();
 };
 // Keys the outline handles itself are shown in the menu but not grabbed by it.
-const item = (label, action, accelerator, opts = {}) => ({ label, click: send(action), accelerator, registerAccelerator: !opts.page, ...opts.extra });
+// A shortcut the person set themselves is always registered with the menu.
+let commands = []; // every menu command, for the Keyboard Shortcuts editor
+let menuPath = [];
+const item = (label, action, accelerator, opts = {}) => {
+  const custom = Object.prototype.hasOwnProperty.call(settings.shortcuts, action);
+  commands.push({ action, label: label.replace(/…$/, ''), menu: menuPath.join(' › '), default: accelerator || '' });
+  const accel = custom ? settings.shortcuts[action] || undefined : accelerator;
+  return { label, click: send(action), accelerator: accel, registerAccelerator: custom ? !!accel : !opts.page, ...opts.extra };
+};
 const pageItem = (label, action, accelerator) => item(label, action, accelerator, { page: true });
+const sub = (label, build) => { menuPath.push(label.replace(/&/g, '')); const submenu = build(); menuPath.pop(); return { label, submenu }; };
 const TEMPLATES = { blank: 'Blank', todo: 'To-Do List', meeting: 'Meeting Notes', budget: 'Budget', project: 'Project Plan', essay: 'Essay Outline' };
 
 function buildMenu() {
+  commands = []; menuPath = [];
   const recent = settings.recent.filter(p => fs.existsSync(p));
   const template = [
-    { label: '&File', submenu: [
-      { label: 'New', accelerator: 'Ctrl+N', click: () => createWindow() },
-      { label: 'New from Template', submenu: Object.entries(TEMPLATES).map(([k, l]) => item(l, 'template:' + k)) },
+    sub('&File', () => [
+      item('New', 'newDoc', 'Ctrl+N'),
+      sub('New from Template', () => Object.entries(TEMPLATES).map(([k, l]) => item(l, 'template:' + k))),
       item('Open…', 'open', 'Ctrl+O'),
       { label: 'Open Recent', enabled: recent.length > 0, submenu: [
         ...recent.map(p => ({ label: p, click: () => createWindow(p) })),
@@ -118,15 +150,18 @@ function buildMenu() {
       item('Save', 'save', 'Ctrl+S'),
       item('Save As…', 'saveAs', 'Ctrl+Shift+S'),
       { type: 'separator' },
-      { label: 'Import', submenu: [item('OPML…', 'import:opml'), item('Markdown…', 'import:markdown'), item('Plain text…', 'import:text')] },
-      { label: 'Export', submenu: [item('OPML…', 'export:opml'), item('Markdown…', 'export:markdown'), item('Plain text…', 'export:text'),
-        item('Web page (HTML)…', 'export:html'), item('CSV spreadsheet…', 'export:csv'), item('PDF…', 'export:pdf')] },
+      sub('Import', () => [item('OPML…', 'import:opml'), item('Markdown…', 'import:markdown'), item('Plain text…', 'import:text'), item('Rich Text (RTF)…', 'import:rtf')]),
+      sub('Export', () => [item('OPML…', 'export:opml'), item('Markdown…', 'export:markdown'), item('Plain text…', 'export:text'), item('Rich Text (RTF)…', 'export:rtf'),
+        { type: 'separator' },
+        item('Excel workbook…', 'export:xlsx'), item('Word document…', 'export:docx'), item('PowerPoint presentation…', 'export:pptx'),
+        { type: 'separator' },
+        item('Web page (HTML)…', 'export:html'), item('CSV spreadsheet…', 'export:csv'), item('PDF…', 'export:pdf')]),
       item('Print…', 'print', 'Ctrl+P'),
       { type: 'separator' },
       { label: 'Close Window', accelerator: 'Ctrl+W', click: () => BrowserWindow.getFocusedWindow()?.close() },
       { label: 'Exit', click: () => app.quit() },
-    ] },
-    { label: '&Edit', submenu: [
+    ]),
+    sub('&Edit', () => [
       pageItem('Undo', 'undo', 'Ctrl+Z'), pageItem('Redo', 'redo', 'Ctrl+Y'),
       { type: 'separator' },
       { role: 'cut' }, { role: 'copy' }, { role: 'paste' },
@@ -136,51 +171,57 @@ function buildMenu() {
       pageItem('Find Next', 'findNext', 'F3'), pageItem('Find Previous', 'findPrev', 'Shift+F3'),
       { type: 'separator' },
       item('Copy Link to Row', 'copyLink'),
-    ] },
-    { label: '&Outline', submenu: [
+    ]),
+    sub('&Outline', () => [
       pageItem('New Row', 'newRow', 'Enter'), item('New Row Above', 'newRowAbove'), pageItem('New Child Row', 'newChild', 'Ctrl+Shift+Enter'),
       { type: 'separator' },
       pageItem('Move Right', 'indent', 'Tab'), pageItem('Move Left', 'outdent', 'Shift+Tab'),
       pageItem('Move Up', 'moveUp', 'Ctrl+Shift+Up'), pageItem('Move Down', 'moveDown', 'Ctrl+Shift+Down'),
       { type: 'separator' },
       pageItem('Check / Uncheck', 'toggleStatus', 'Ctrl+Enter'), pageItem('Add or Edit Note', 'toggleNote', "Ctrl+'"),
+      item('Record Audio', 'record', 'Ctrl+Shift+R'), item('Attach Files…', 'attachFiles'),
       pageItem('Duplicate', 'duplicate', 'Ctrl+D'), pageItem('Delete Rows', 'deleteRows', 'Ctrl+Shift+K'),
       { type: 'separator' },
       pageItem('Collapse', 'collapse', 'Alt+Left'), pageItem('Expand', 'expand', 'Alt+Right'),
       pageItem('Collapse All', 'collapseAll', 'Alt+Shift+Left'), pageItem('Expand All', 'expandAll', 'Alt+Shift+Right'),
       { type: 'separator' },
       pageItem('Focus on Selection', 'focus', 'Ctrl+Shift+F'), item('Show Entire Outline', 'unfocus'),
+      item('Edit Filter…', 'filterEditor', 'Ctrl+Shift+G'), item('Clear Filter', 'clearFilter'),
       { type: 'separator' },
-      { label: 'Add Column', submenu: [['Text', 'text'], ['Number', 'number'], ['Duration', 'duration'], ['Date', 'date'], ['Checkbox', 'checkbox'], ['Pop-up list', 'popup']]
-        .map(([l, t]) => item(l, 'addColumn:' + t)) },
-    ] },
-    { label: 'F&ormat', submenu: [
+      sub('Add Column', () => [['Text', 'text'], ['Number', 'number'], ['Duration', 'duration'], ['Date', 'date'], ['Checkbox', 'checkbox'], ['Pop-up list', 'popup']]
+        .map(([l, t]) => item(l, 'addColumn:' + t))),
+    ]),
+    sub('F&ormat', () => [
       pageItem('Bold', 'bold', 'Ctrl+B'), pageItem('Italic', 'italic', 'Ctrl+I'), pageItem('Underline', 'underline', 'Ctrl+U'),
       pageItem('Strikethrough', 'strike', 'Ctrl+Shift+X'), item('Clear Row Style', 'clearStyle'),
       { type: 'separator' },
-      { label: 'Theme', submenu: [['Standard', 'standard'], ['Paper', 'paper'], ['Ocean', 'ocean'], ['Forest', 'forest'], ['Mono', 'mono']].map(([l, t]) => item(l, 'theme:' + t)) },
-      { label: 'Appearance', submenu: [item('Match Windows', 'appearance:system'), item('Light', 'appearance:light'), item('Dark', 'appearance:dark')] },
-      { label: 'Row Numbering', submenu: [item('None', 'numbering:none'), item('I. A. 1. a.', 'numbering:outline'), item('1.1.1', 'numbering:decimal'), item('1. on each level', 'numbering:simple')] },
-    ] },
-    { label: '&View', submenu: [
+      sub('Theme', () => [['Standard', 'standard'], ['Paper', 'paper'], ['Ocean', 'ocean'], ['Forest', 'forest'], ['Mono', 'mono']].map(([l, t]) => item(l, 'theme:' + t))),
+      sub('Appearance', () => [item('Match Windows', 'appearance:system'), item('Light', 'appearance:light'), item('Dark', 'appearance:dark')]),
+      sub('Row Numbering', () => [item('None', 'numbering:none'), item('I. A. 1. a.', 'numbering:outline'), item('1.1.1', 'numbering:decimal'), item('1. on each level', 'numbering:simple')]),
+    ]),
+    sub('&View', () => [
       pageItem('Sidebar', 'toggleSidebar', 'Ctrl+Shift+L'), pageItem('Inspector', 'toggleInspector', 'Ctrl+Shift+I'),
       item('Notes', 'toggleNotes'), item('Checkboxes', 'toggleStatusColumn'),
       { type: 'separator' },
+      item('Folded Editing', 'toggleFolded', 'Ctrl+Shift+E'),
+      item('Typewriter Scrolling', 'toggleTypewriter', 'Ctrl+Shift+T'),
       pageItem('Distraction-Free Mode', 'toggleZen', 'Ctrl+Shift+D'),
       { role: 'togglefullscreen' },
       { type: 'separator' },
+      item('New Window on This Outline', 'mirrorWindow'),
+      { type: 'separator' },
       { role: 'zoomIn', accelerator: 'Ctrl+=' }, { role: 'zoomOut' }, { role: 'resetZoom' },
       ...(app.isPackaged ? [] : [{ type: 'separator' }, { role: 'toggleDevTools', accelerator: 'F12' }]),
-    ] },
-    { label: '&Automation', submenu: [item('Automation Console…', 'automation')] },
-    { label: '&Help', submenu: [
-      item('Keyboard Shortcuts', 'shortcuts'),
+    ]),
+    sub('&Automation', () => [item('Automation Console…', 'automation')]),
+    sub('&Help', () => [
+      item('Keyboard Shortcuts…', 'shortcuts'),
       { label: 'Check for Updates…', click: () => checkForUpdates(true) },
       { label: 'Project Page', click: () => shell.openExternal('https://github.com/c0linzeal/arbor-outliner') },
       { type: 'separator' },
       { label: 'About Arbor Outliner', click: () => dialog.showMessageBox({ type: 'info', title: 'About', message: `Arbor Outliner ${app.getVersion()}`,
         detail: 'An outliner for Windows: rows, columns, checkboxes, styles, notes, focus and filters.' }) },
-    ] },
+    ]),
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
@@ -241,7 +282,7 @@ ipcMain.handle('open-dialog', async (e, kind) => {
   const r = await dialog.showOpenDialog(W(e), { properties: ['openFile'], filters: FILTERS[kind] || FILTERS.all });
   if (r.canceled || !r.filePaths.length) return null;
   const p = r.filePaths[0];
-  if (/\.arbor$/i.test(p)) addRecent(p);
+  if (/\.(arbor|opml)$/i.test(p)) addRecent(p);
   return { path: p, content: fs.readFileSync(p, 'utf8') };
 });
 ipcMain.handle('save-dialog', async (e, name, kind) => {
@@ -252,7 +293,7 @@ ipcMain.handle('save-dialog', async (e, name, kind) => {
 });
 ipcMain.handle('write-file', async (_e, p, content) => {
   const tmp = p + '.saving';
-  await fs.promises.writeFile(tmp, content, 'utf8');
+  await fs.promises.writeFile(tmp, typeof content === 'string' ? content : Buffer.from(content), typeof content === 'string' ? 'utf8' : undefined);
   await fs.promises.rename(tmp, p); // replace in one step so a crash never leaves half a file
 });
 ipcMain.handle('export-pdf', async (e, name) => {
@@ -274,6 +315,34 @@ ipcMain.on('copy-text', (_e, t) => clipboard.writeText(String(t)));
 ipcMain.on('new-window', (_e, template) => createWindow(null, { template }));
 ipcMain.on('open-in-new-window', (_e, p) => createWindow(p));
 ipcMain.on('close-window', e => { const s = S(e); if (s) { s.force = true; s.win.close(); } });
+
+// Keyboard shortcuts the person changed (Help > Keyboard Shortcuts).
+ipcMain.handle('get-shortcuts', () => ({ commands, overrides: settings.shortcuts }));
+ipcMain.handle('set-shortcuts', (_e, overrides) => {
+  settings.shortcuts = Object.fromEntries(Object.entries(overrides || {}).filter(([k, v]) => typeof k === 'string' && typeof v === 'string'));
+  saveSettings(); buildMenu();
+  for (const s of wins.values()) s.win.webContents.send('shortcuts', settings.shortcuts);
+  return true;
+});
+
+// A second window on the same outline: both show every change the other makes.
+ipcMain.on('mirror-window', (e, doc, docPath) => {
+  const s = S(e); if (!s) return;
+  if (!s.group) s.group = ++groupSeq;
+  createWindow(null, { mirror: { group: s.group, doc, path: docPath } });
+});
+ipcMain.on('sync-doc', (e, doc) => { const s = S(e); if (s) for (const o of groupPeers(s)) o.win.webContents.send('sync', doc); });
+
+// Audio recordings are saved next to the outline (or in the app's folder until it is saved).
+ipcMain.handle('save-recording', async (e, docPath, name, bytes) => {
+  const dir = docPath ? path.join(path.dirname(docPath), path.basename(docPath).replace(/\.[^.]+$/, '') + ' Attachments')
+    : path.join(app.getPath('userData'), 'Recordings');
+  await fs.promises.mkdir(dir, { recursive: true });
+  let p = path.join(dir, name.replace(/[\\/:*?"<>|]/g, '-'));
+  for (let i = 2; fs.existsSync(p); i++) p = path.join(dir, name.replace(/(\.[^.]+)$/, ` ${i}$1`));
+  await fs.promises.writeFile(p, Buffer.from(bytes));
+  return p;
+});
 
 // ---------------------------------------------------------------- start-up
 function openLink(url) {

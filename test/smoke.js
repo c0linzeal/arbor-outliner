@@ -192,6 +192,112 @@ module.exports = async ({ createWindow, app, wins }) => {
       if (n < 1) throw new Error(tab + ' tab is empty');
     }
   });
+  await check('filter by column value, saved and edited from the sidebar', async () => {
+    await js(`${A}.setDoc(${A}.M.fromTemplate('project'), null)`); await wait(100);
+    await js(`{ const d = ${A}.state.doc, pri = d.columns[3]; d.root.children[1].children[0].values[pri.id] = 'High';
+      ${A}.state.filter = { text: '', status: 'all', rules: [] }; }`);
+    await js(`${A}.run('filterEditor')`); await wait(100);
+    await js(`[...document.querySelectorAll('#modal button')].find(b => b.textContent === '+ Add condition').click()`); await wait(60);
+    await js(`{ const [col, op] = document.querySelectorAll('#modal .rule select'); col.value = ${A}.state.doc.columns[3].id; col.dispatchEvent(new Event('change')); }`); await wait(60);
+    await js(`{ const v = document.querySelectorAll('#modal .rule select')[2]; v.value = 'High'; v.dispatchEvent(new Event('change'));
+      const n = document.querySelector('#modal .form input:last-of-type'); const name = [...document.querySelectorAll('#modal .form input')].pop(); name.value = 'Urgent'; name.dispatchEvent(new Event('input')); }`);
+    await js(`document.querySelector('#modal .actions button:last-child').click()`); await wait(120);
+    eq(JSON.parse(await js(`JSON.stringify([...document.querySelectorAll('#rows .topic')].map(t => t.textContent))`)), ['Build', 'First draft'], 'filtered rows');
+    eq(await js(`${A}.state.doc.filters.map(f => f.name).join()`), 'Urgent', 'saved filter');
+    eq(await js(`[...document.querySelectorAll('#sidebar .item.active')].some(i => i.textContent.startsWith('Urgent'))`), true, 'sidebar shows it active');
+    await js(`${A}.run('clearFilter')`); await wait(60);
+    eq(await rowCount(), 8, 'all rows back');
+  });
+  await check('find lists every match in the sidebar', async () => {
+    await key('F', 'control');
+    await js(`{ const f = document.getElementById('findText'); f.value = 'e'; f.dispatchEvent(new Event('input')); }`); await wait(100);
+    const n = await js(`${A}.state.find.matches.length`);
+    eq(await js(`document.querySelectorAll('#sidebar .item.result').length`), n, 'one sidebar entry per match');
+    await js(`document.querySelectorAll('#sidebar .item.result')[2].click()`); await wait(80);
+    eq(await js(`${A}.state.find.idx`), 2, 'clicking a result goes to it');
+    eq(await js(`document.getElementById('findCount').textContent`), `3 of ${n}`, 'count');
+    await js(`${A}.run('closeFind')`); await wait(60);
+    eq(await js(`document.querySelectorAll('#sidebar .item.result').length`), 0, 'results gone when find closes');
+  });
+  await check('folded editing and typewriter scrolling', async () => {
+    await js(`${A}.state.doc.root.children[0].text = 'A very long row '.repeat(30); ${A}.state.folded = false; ${A}.state.typewriter = false; ${A}.run('toggleFolded')`); await wait(60);
+    await js(`${A}.setDoc(${A}.state.doc, null)`); await wait(60);
+    eq(await js(`document.body.classList.contains('folded')`), true, 'folded class');
+    eq(await js(`getComputedStyle(document.querySelectorAll('#rows .topic')[0]).textWrapMode`), 'nowrap', 'rows not being edited fold to one line');
+    await js(`${A}.run('toggleFolded'); ${A}.run('toggleTypewriter')`); await wait(60);
+    await focusTopic('Announce'); await type('!'); await wait(120);
+    const off = await js(`(() => { const o = document.getElementById('outline').getBoundingClientRect(), r = document.activeElement.getBoundingClientRect(); return Math.abs((r.top + r.height / 2) - (o.top + o.height * 0.45)); })()`);
+    if (off > 30) throw new Error('caret line is ' + Math.round(off) + 'px from the middle');
+    await js(`${A}.run('toggleTypewriter')`);
+  });
+  await check('custom keyboard shortcut replaces the built-in one', async () => {
+    await js(`window.api.setShortcuts({ bold: 'Ctrl+Alt+B' })`); await wait(150);
+    eq(await js(`'Ctrl+b' in ${A}.state.shortcuts || Object.keys(${A}.state.shortcuts).join()`), 'bold', 'override received');
+    const { Menu } = require('electron');
+    const bold = Menu.getApplicationMenu().items.find(m => m.label === 'F&ormat').submenu.items.find(i => i.label === 'Bold');
+    eq(bold.accelerator, 'Ctrl+Alt+B', 'menu shows the new keys');
+    eq(JSON.parse(await js(`JSON.stringify([...document.querySelectorAll('#rows .topic')].map(t => t.textContent).slice(-2))`)), ['Launch', 'Announce!'], 'rows');
+    await focusTopic('Announce!'); await key('B', 'control');
+    eq(await js(`!!${A}.state.doc.root.children[2].children[0].style.bold`), false, 'old keys do nothing');
+    bold.click(); await wait(80);
+    eq(await js(`!!${A}.state.doc.root.children[2].children[0].style.bold`), true, 'the command still works');
+    await js(`window.api.setShortcuts({})`); await wait(150);
+    eq(await js(`${A}.keyName({ code: 'KeyB', key: 'B', ctrlKey: true, shiftKey: true, altKey: false })`), 'Ctrl+Shift+B', 'key names');
+    eq(await js(`${A}.accelToKey('Ctrl+Shift+Up') + ' ' + ${A}.keyToAccel('Ctrl+Alt+ArrowLeft')`), 'Ctrl+Shift+ArrowUp Ctrl+Alt+Left', 'key conversions');
+  });
+  await check('shortcut editor draws every menu command', async () => {
+    await js(`${A}.run('shortcuts')`); await wait(200);
+    const n = await js(`document.querySelectorAll('#modal table.keys tr').length`);
+    if (n < 60) throw new Error('only ' + n + ' commands listed');
+    await key('Escape'); await wait(60);
+    eq(await js(`document.getElementById('modal').hidden`), true, 'closes with Esc');
+  });
+  await check('images resize by dragging the corner', async () => {
+    const img = path.join(__dirname, '..', 'assets', 'icon.png');
+    await js(`${A}.state.doc.root.children[0].attachments.push({ name: 'icon.png', path: ${JSON.stringify(img)} }); ${A}.setDoc(${A}.state.doc, null)`); await wait(200);
+    await js(`document.querySelector('.chip.image').scrollIntoView({ block: 'center' })`); await wait(60);
+    const box = JSON.parse(await js(`JSON.stringify(document.querySelector('.chip.image .resize').getBoundingClientRect())`));
+    const x = Math.round(box.x + 5), y = Math.round(box.y + 5);
+    eq(await js(`document.elementFromPoint(${x}, ${y}).className`), 'resize', 'corner under the pointer');
+    wc.sendInputEvent({ type: 'mouseMove', x, y }); await wait(30);
+    wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 }); await wait(30);
+    wc.sendInputEvent({ type: 'mouseMove', x: x + 120, y, button: 'left' }); await wait(30);
+    wc.sendInputEvent({ type: 'mouseUp', x: x + 120, y, button: 'left', clickCount: 1 }); await wait(100);
+    const w = await js(`${A}.state.doc.root.children[0].attachments[0].width`);
+    if (!(w > 100)) throw new Error('width after drag: ' + w);
+  });
+  await check('audio recording attaches a playable file to the row', async () => {
+    await js(`document.querySelector('#rows .topic').focus()`); await key('Escape');
+    await js(`${A}.run('record')`); await wait(1800);
+    eq(await js(`!!document.querySelector('#statusbar .rec')`), true, 'recording shown');
+    await js(`${A}.run('record')`); await wait(900);
+    const att = JSON.parse(await js(`JSON.stringify(${A}.state.doc.root.children[0].attachments.slice(-1)[0] || null)`));
+    if (!att || !/\.webm$/.test(att.path) || !fs.existsSync(att.path) || fs.statSync(att.path).size < 500) throw new Error('recording: ' + JSON.stringify(att));
+    eq(await js(`!!document.querySelector('.chip.audio audio')`), true, 'player shown');
+    fs.unlinkSync(att.path);
+  });
+  const opml = path.join(os.tmpdir(), `arbor-smoke-${Date.now()}.opml`);
+  await check('OPML mode: an .opml file is edited and saved as OPML', async () => {
+    fs.writeFileSync(opml, '<?xml version="1.0"?><opml version="2.0"><head><title>Trip</title></head><body><outline text="Pack"><outline text="Passport"/></outline></body></opml>');
+    await js(`${A}.loadContent(${JSON.stringify(opml)}, ${JSON.stringify(fs.readFileSync(opml, 'utf8'))})`); await wait(100);
+    eq(await js(`${A}.state.path`), opml, 'kept its path');
+    eq(await js(`document.querySelector('#statusbar .badge').textContent`), 'OPML', 'badge');
+    await focusTopic('Passport'); await type(' and tickets'); await wait(1700);
+    const saved = fs.readFileSync(opml, 'utf8');
+    if (!saved.includes('<outline text="Passport and tickets"/>') || !saved.startsWith('<?xml')) throw new Error(saved.slice(0, 300));
+  });
+  await check('a second window on the same outline shows changes from the first', async () => {
+    await js(`${A}.run('mirrorWindow')`); await wait(900);
+    const other = [...wins.values()].find(s => s.win !== win).win.webContents;
+    eq(await other.executeJavaScript(`${A}.state.doc.root.children[0].children[0].text`), 'Passport and tickets', 'opened with the outline');
+    await focusTopic('Pack'); await type(' bags'); await wait(500);
+    eq(await other.executeJavaScript(`${A}.state.doc.root.children[0].text`), 'Pack bags', 'change arrived');
+    await other.executeJavaScript(`${A}.state.doc.root.children[0].text = 'Pack bags now'; ${A}.run('markDirty'); window.api.syncDoc(JSON.stringify(${A}.state.doc))`); await wait(400);
+    eq(await js(`${A}.state.doc.root.children[0].text`), 'Pack bags now', 'and back again');
+    other.close(); await wait(300);
+    eq(await js(`document.getElementById('statusbar').textContent.includes('another window')`), false, 'on its own again');
+    eq(await js(`document.getElementById('statusbar').textContent.includes('null')`), false, 'status bar text');
+  });
   await check('new window opens', async () => {
     await js(`${A}.run('newDoc')`); await wait(800);
     eq(wins.size, 2, 'window count');
@@ -205,8 +311,16 @@ module.exports = async ({ createWindow, app, wins }) => {
     await js(`${A}.run('appearance:dark'); ${A}.run('theme:ocean'); ${A}.state.inspectorTab = 'style'; ${A}.run('toggleInspector'); ${A}.run('toggleInspector')`);
     await wait(300);
     fs.writeFileSync(process.env.SMOKE_SHOT + '-dark.png', (await wc.capturePage()).toPNG());
+    await js(`${A}.run('appearance:light'); ${A}.run('theme:standard'); ${A}.run('filterEditor')`); await wait(200);
+    await js(`[...document.querySelectorAll('#modal button')].find(b => b.textContent === '+ Add condition').click()`); await wait(200);
+    fs.writeFileSync(process.env.SMOKE_SHOT + '-filter.png', (await wc.capturePage()).toPNG());
+    await key('Escape'); await js(`${A}.run('shortcuts')`); await wait(300);
+    fs.writeFileSync(process.env.SMOKE_SHOT + '-keys.png', (await wc.capturePage()).toPNG());
+    await key('Escape'); await key('F', 'control');
+    await js(`{ const f = document.getElementById('findText'); f.value = 'e'; f.dispatchEvent(new Event('input')); }`); await wait(200);
+    fs.writeFileSync(process.env.SMOKE_SHOT + '-find.png', (await wc.capturePage()).toPNG());
   }
-  try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+  for (const f of [tmp, opml]) try { fs.unlinkSync(f); } catch { /* already gone */ }
   console.log('\n' + results.join('\n') + `\n\n${results.length - failed} passed, ${failed} failed`);
   app.exit(failed ? 1 : 0);
 };

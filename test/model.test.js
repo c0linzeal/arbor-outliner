@@ -118,4 +118,35 @@ const n = M.normalize({ title: 'X', root: { children: [{ text: 'hi' }] } });
 assert.strictEqual(n.root.children[0].children.length, 0);
 assert.ok(n.styles.named.length);
 
+// column conditions in filters
+d = M.fromTemplate('project');
+const [owner, due, est, pri] = d.columns;
+const shown = rules => M.visibleRows(d, { rules }).map(v => v.row.text);
+d.root.children[0].children[0].values[pri.id] = 'High';
+assert.deepStrictEqual(shown([{ col: pri.id, op: 'is', value: 'high' }]), ['Plan', 'Define goals'], 'pop-up value, with its parent row');
+d.root.children[1].children[1].values[owner.id] = 'Yuki';
+assert.deepStrictEqual(shown([{ col: owner.id, op: 'contains', value: 'yu' }]), ['Build', 'Review']);
+assert.deepStrictEqual(shown([{ col: owner.id, op: 'filled' }, { col: pri.id, op: 'is', value: 'High' }]), [], 'every condition must match');
+d.root.children[2].children[0].values[est.id] = 16;
+assert.deepStrictEqual(shown([{ col: est.id, op: 'gt', value: '1d' }]), ['Launch', 'Announce'], 'durations compare as time; parent total 2d also matches');
+d.root.children[0].children[1].values[due.id] = '2000-01-01';
+assert.ok(shown([{ col: due.id, op: 'past' }]).includes('Agree scope'));
+assert.deepStrictEqual(shown([{ col: due.id, op: 'before', value: '2001-01-01' }]), ['Plan', 'Agree scope']);
+assert.strictEqual(shown([{ col: 'gone', op: 'is', value: 'x' }]).length, M.visibleRows(d).length, 'a rule for a deleted column is ignored');
+
+// Office exports are valid zip packages; RTF reads back as the same outline
+const O = require('../src/office.js');
+const zipNames = buf => { const out = []; for (let i = 0; i < buf.length - 4; i++) if (buf[i] === 0x50 && buf[i + 1] === 0x4b && buf[i + 2] === 1 && buf[i + 3] === 2) { const n = buf[i + 28] | buf[i + 29] << 8; out.push(Buffer.from(buf.slice(i + 46, i + 46 + n)).toString()); } return out; };
+assert.ok(zipNames(O.toXLSX(d)).includes('xl/worksheets/sheet1.xml'));
+assert.ok(zipNames(O.toDOCX(d)).includes('word/document.xml'));
+assert.ok(zipNames(O.toPPTX(d)).includes(`ppt/slides/slide${d.root.children.length + 1}.xml`), 'a title slide plus one per top-level row');
+assert.strictEqual(O.crc32(new TextEncoder().encode('123456789')), 0xcbf43926);
+d = M.fromTemplate('essay'); d.statusVisible = true; d.numbering = 'none';
+d.root.children[0].note = 'Opening "line"'; d.root.children[1].children[0].state = true; d.root.children[2].text = 'Conclusión {final} \\ 終わり';
+back = O.fromRTF(O.toRTF(d), 'x');
+assert.deepStrictEqual(M.allRows(back).map(r => r.text), M.allRows(d).map(r => r.text));
+assert.strictEqual(back.title, 'Essay Outline');
+assert.strictEqual(back.root.children[0].note, 'Opening "line"');
+assert.strictEqual(back.root.children[1].children[0].state, true);
+
 console.log('model tests passed');

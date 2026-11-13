@@ -21,4 +21,12 @@ contextBridge.exposeInMainWorld('api', {
   newWindow: template => ipcRenderer.send('new-window', template),
   openInNewWindow: path => ipcRenderer.send('open-in-new-window', path),
   closeWindow: () => ipcRenderer.send('close-window'),
+  onShortcuts: cb => ipcRenderer.on('shortcuts', (_e, o) => cb(o)),
+  getShortcuts: () => ipcRenderer.invoke('get-shortcuts'),
+  setShortcuts: o => ipcRenderer.invoke('set-shortcuts', o),
+  mirrorWindow: (doc, path) => ipcRenderer.send('mirror-window', doc, path),
+  onMirror: cb => ipcRenderer.on('mirror', (_e, m) => cb(m)),
+  syncDoc: doc => ipcRenderer.send('sync-doc', doc),
+  onSync: cb => ipcRenderer.on('sync', (_e, doc) => cb(doc)),
+  saveRecording: (docPath, name, bytes) => ipcRenderer.invoke('save-recording', docPath, name, bytes),
 });
