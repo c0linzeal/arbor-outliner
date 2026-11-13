@@ -13,13 +13,21 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
       - run: npm ci
       - run: node test/model.test.js
-      - run: npx electron-builder --win --publish always
+      - run: npx electron-builder --win --publish never
+      # One step creates the release with every file. (electron-builder's own publishing
+      # uploaded files in parallel and made two releases for one tag.)
+      - name: Publish release
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" --title "Arbor Outliner $v" --generate-notes \
+            "release/Arbor-Outliner-Setup-$v.exe" "release/Arbor-Outliner-Setup-$v.exe.blockmap" release/latest.yml
