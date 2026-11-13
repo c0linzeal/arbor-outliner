@@ -298,6 +298,36 @@ module.exports = async ({ createWindow, app, wins }) => {
     eq(await js(`document.getElementById('statusbar').textContent.includes('another window')`), false, 'on its own again');
     eq(await js(`document.getElementById('statusbar').textContent.includes('null')`), false, 'status bar text');
   });
+  await check('focus on several sections: selected rows, then Ctrl+click in the sidebar', async () => {
+    await js(`${A}.setDoc(${A}.M.fromTemplate('project'), null)`); await wait(100);
+    await js(`{ const k = ${A}.state.doc.root.children; ${A}.state.sel = new Set([k[0].id, k[2].id]); ${A}.run('focus'); }`); await wait(80);
+    eq(await rowCount(), 5, 'Plan and Launch with their rows');
+    eq(await js(`document.getElementById('focusbar').textContent.startsWith('Focused on 2 sections: Plan, Launch')`), true, 'focus bar');
+    const click = (label, ctrl) => js(`[...document.querySelectorAll('#sidebar .item')].find(i => i.textContent === ${JSON.stringify(label)})
+      .dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: ${ctrl} }))`);
+    await click('Build', true); await wait(80);
+    eq(await rowCount(), 8, 'Ctrl+click adds Build');
+    eq(await js(`[...document.querySelectorAll('#sidebar .item.active')].map(i => i.textContent).filter(t => ['Plan', 'Build', 'Launch'].includes(t)).length`), 3, 'all three marked in the sidebar');
+    await click('Plan', true); await wait(80);
+    eq(JSON.parse(await js(`JSON.stringify([...document.querySelectorAll('#rows .topic')].map(t => t.textContent))`)), ['Build', 'First draft', 'Review', 'Launch', 'Announce'], 'Ctrl+click again takes Plan out');
+    await click('Plan', false); await wait(80);
+    eq(await rowCount(), 3, 'a plain click focuses on just that section');
+    await js(`${A}.run('unfocus')`); await wait(60);
+    eq(await rowCount(), 8, 'whole outline again');
+  });
+  const docx = path.join(os.tmpdir(), `arbor-smoke-${Date.now()}.docx`);
+  await check('opening a Word document turns its headings and lists into rows', async () => {
+    const O = require('../src/office.js'), M = require('../src/model.js');
+    const src = M.fromTemplate('essay'); src.root.children[0].note = 'Start strong';
+    fs.writeFileSync(docx, require('./deflate-zip.js')(O.toDOCX(src)));
+    const w2 = createWindow(docx); await new Promise(r => w2.webContents.once('did-finish-load', r)); await wait(600);
+    const got = JSON.parse(await w2.webContents.executeJavaScript(`JSON.stringify({ rows: ${A}.M.allRows(${A}.state.doc).map(r => r.text), note: ${A}.state.doc.root.children[0].note, path: ${A}.state.path, title: ${A}.state.doc.title })`));
+    eq(got.rows, M.allRows(src).map(r => r.text), 'rows');
+    eq(got.note, 'Start strong', 'note');
+    eq(got.path, null, 'imported as a new, unsaved outline');
+    eq(got.title, 'Essay Outline', 'title');
+    w2.destroy(); await wait(200);
+  });
   await check('new window opens', async () => {
     await js(`${A}.run('newDoc')`); await wait(800);
     eq(wins.size, 2, 'window count');
@@ -320,7 +350,7 @@ module.exports = async ({ createWindow, app, wins }) => {
     await js(`{ const f = document.getElementById('findText'); f.value = 'e'; f.dispatchEvent(new Event('input')); }`); await wait(200);
     fs.writeFileSync(process.env.SMOKE_SHOT + '-find.png', (await wc.capturePage()).toPNG());
   }
-  for (const f of [tmp, opml]) try { fs.unlinkSync(f); } catch { /* already gone */ }
+  for (const f of [tmp, opml, docx]) try { fs.unlinkSync(f); } catch { /* already gone */ }
   console.log('\n' + results.join('\n') + `\n\n${results.length - failed} passed, ${failed} failed`);
   app.exit(failed ? 1 : 0);
 };

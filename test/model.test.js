@@ -149,4 +149,35 @@ assert.strictEqual(back.title, 'Essay Outline');
 assert.strictEqual(back.root.children[0].note, 'Opening "line"');
 assert.strictEqual(back.root.children[1].children[0].state, true);
 
-console.log('model tests passed');
+// focusing on several sections at once
+d = M.fromTemplate('project');
+const [plan, build, launch] = d.root.children;
+assert.deepStrictEqual(M.visibleRows(d, { focusIds: [launch.id, plan.id] }).map(v => v.row.text + v.depth),
+  ['Plan0', 'Define goals1', 'Agree scope1', 'Launch0', 'Announce1'], 'focused sections in outline order');
+assert.deepStrictEqual(M.visibleRows(d, { focusIds: [plan.id, plan.children[0].id] }).length, 3, 'a row inside another focused row is not shown twice');
+M.outdent(d, [launch.children[0].id], [plan.id, launch.id]);
+assert.strictEqual(launch.children.length, 1, 'rows stay inside a focused section when moved left');
+
+// Word and PowerPoint import (Arbor's own exports, re-packed with deflate as Office does)
+const deflateZip = require('./deflate-zip.js');
+(async () => {
+  const p = M.fromTemplate('project');
+  p.root.children[0].note = 'Kick-off'; p.root.children[0].children[0].state = true;
+  const w = await O.fromDOCX(deflateZip(O.toDOCX(p)), 'x');
+  assert.strictEqual(w.title, 'Project Plan');
+  assert.deepStrictEqual(M.allRows(w).map(r => r.text), M.allRows(p).map(r => r.text));
+  assert.deepStrictEqual(w.columns.map(c => c.name + ':' + c.type), ['Owner:text', 'Due:text', 'Estimate:duration', 'Priority:text']);
+  assert.strictEqual(w.root.children[0].note, 'Kick-off');
+  assert.strictEqual(w.root.children[0].children[0].state, true);
+  const e = M.fromTemplate('essay'); e.root.children[1].note = 'Three points';
+  const we = await O.fromDOCX(deflateZip(O.toDOCX(e)), 'x');
+  assert.deepStrictEqual(M.allRows(we).map(r => r.text), M.allRows(e).map(r => r.text), 'numbered paragraphs');
+  assert.strictEqual(we.root.children[1].note, 'Three points');
+  const s = await O.fromPPTX(deflateZip(O.toPPTX(p)), 'x');
+  assert.strictEqual(s.title, 'Project Plan', 'the cover slide gives the title');
+  assert.deepStrictEqual(M.allRows(s).map(r => r.text), M.allRows(p).map(r => r.text), 'one row per slide, bullets inside');
+  assert.strictEqual(s.root.children[0].note, 'Kick-off');
+  assert.strictEqual(s.root.children[0].children[0].state, true);
+  await assert.rejects(O.fromDOCX(new Uint8Array(100), 'x'), /not an Office document/);
+  console.log('model tests passed');
+})().catch(err => { console.error(err); process.exit(1); });

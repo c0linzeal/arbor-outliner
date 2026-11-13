@@ -161,11 +161,16 @@
       out.push({ row: r, depth });
       if (filtering || !r.collapsed) r.children.forEach(c => visit(c, depth + 1));
     };
-    const f = opts.focusId && find(doc, opts.focusId);
-    if (f) { // a focused row always shows its children, even if it is collapsed
-      if (filtering && !keep(f.row)) return out;
-      out.push({ row: f.row, depth: 0 });
-      f.row.children.forEach(c => visit(c, 1));
+    // Focus on one or more sections: each is shown at the top level, in outline order,
+    // and always shows its children even if it is collapsed.
+    const ids = topLevel(doc, opts.focusIds || (opts.focusId ? [opts.focusId] : []));
+    if (ids.length) {
+      for (const id of ids) {
+        const f = find(doc, id);
+        if (filtering && !keep(f.row)) continue;
+        out.push({ row: f.row, depth: 0 });
+        f.row.children.forEach(c => visit(c, 1));
+      }
     } else doc.root.children.forEach(c => visit(c, 0));
     return out;
   }
@@ -183,10 +188,12 @@
       prev.collapsed = false;
     }
   }
-  function outdent(doc, ids, limitId) {
+  // limit: a focused row id (or list of them); rows directly inside it stay inside it.
+  function outdent(doc, ids, limit) {
+    const stop = new Set([].concat(limit || []));
     for (const id of topLevel(doc, ids).reverse()) {
       const f = find(doc, id);
-      if (f.parent === doc.root || f.parent.id === limitId) continue;
+      if (f.parent === doc.root || stop.has(f.parent.id)) continue;
       const p = find(doc, f.parent.id);
       f.parent.children.splice(f.index, 1);
       p.parent.children.splice(p.index + 1, 0, f.row);
@@ -596,7 +603,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #e5e5e5;
 
   return {
     uid, row, column, newDoc, normalize, walk, find, ancestors, contains, topLevel, allRows,
-    statusOf, setStatus, visibleRows, matchRule, RULE_OPS, indent, outdent, moveUp, moveDown, deleteRows, duplicate, moveTo, insertRows, clone,
+    statusOf, setStatus, visibleRows, matchRule, RULE_OPS, guessType, indent, outdent, moveUp, moveDown, deleteRows, duplicate, moveTo, insertRows, clone,
     parseDuration, formatDuration, parseValue, formatValue, cellValue, setCheckboxCell, convertColumn, sortChildren,
     prefix, numberPaths, resolveStyle, styleCss, stats,
     toOPML, fromOPML, toMarkdown, fromMarkdown, toText, fromText, rowsToText, toCSV, toHTML,

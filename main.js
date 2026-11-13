@@ -11,9 +11,11 @@ if (SMOKE) {
   app.commandLine.appendSwitch('use-fake-device-for-media-stream'); app.commandLine.appendSwitch('use-fake-ui-for-media-stream');
   app.setPath('userData', path.join(require('os').tmpdir(), 'arbor-smoke-profile'));
 }
-const DOC_EXT = /\.(arbor|opml|md|markdown|txt|rtf)$/i;
+const DOC_EXT = /\.(arbor|opml|md|markdown|txt|rtf|docx|pptx)$/i;
+const BINARY = /\.(docx|pptx)$/i; // read as bytes, not text
+const readDoc = p => BINARY.test(p) ? fs.readFileSync(p) : fs.readFileSync(p, 'utf8');
 const FILTERS = {
-  all: [{ name: 'Outlines', extensions: ['arbor', 'opml', 'md', 'markdown', 'txt', 'rtf'] }, { name: 'All files', extensions: ['*'] }],
+  all: [{ name: 'Outlines and documents', extensions: ['arbor', 'opml', 'md', 'markdown', 'txt', 'rtf', 'docx', 'pptx'] }, { name: 'All files', extensions: ['*'] }],
   arbor: [{ name: 'Arbor outline', extensions: ['arbor'] }],
   save: [{ name: 'Arbor outline', extensions: ['arbor'] }, { name: 'OPML outline (keeps rows, notes, checkboxes and columns)', extensions: ['opml'] }],
   rtf: [{ name: 'Rich Text', extensions: ['rtf'] }],
@@ -102,7 +104,7 @@ function createWindow(file, extra = {}) {
 
 function sendFile(win, file, reveal) {
   let content;
-  try { content = fs.readFileSync(file, 'utf8'); }
+  try { content = readDoc(file); }
   catch (err) { dialog.showErrorBox('Could not open the file', `${file}\n\n${err.message}`); return; }
   win.webContents.send('load', { path: file, content, reveal });
   addRecent(file);
@@ -150,7 +152,8 @@ function buildMenu() {
       item('Save', 'save', 'Ctrl+S'),
       item('Save As…', 'saveAs', 'Ctrl+Shift+S'),
       { type: 'separator' },
-      sub('Import', () => [item('OPML…', 'import:opml'), item('Markdown…', 'import:markdown'), item('Plain text…', 'import:text'), item('Rich Text (RTF)…', 'import:rtf')]),
+      sub('Import', () => [item('OPML…', 'import:opml'), item('Markdown…', 'import:markdown'), item('Plain text…', 'import:text'), item('Rich Text (RTF)…', 'import:rtf'),
+        { type: 'separator' }, item('Word document…', 'import:docx'), item('PowerPoint presentation…', 'import:pptx')]),
       sub('Export', () => [item('OPML…', 'export:opml'), item('Markdown…', 'export:markdown'), item('Plain text…', 'export:text'), item('Rich Text (RTF)…', 'export:rtf'),
         { type: 'separator' },
         item('Excel workbook…', 'export:xlsx'), item('Word document…', 'export:docx'), item('PowerPoint presentation…', 'export:pptx'),
@@ -283,7 +286,7 @@ ipcMain.handle('open-dialog', async (e, kind) => {
   if (r.canceled || !r.filePaths.length) return null;
   const p = r.filePaths[0];
   if (/\.(arbor|opml)$/i.test(p)) addRecent(p);
-  return { path: p, content: fs.readFileSync(p, 'utf8') };
+  return { path: p, content: readDoc(p) };
 });
 ipcMain.handle('save-dialog', async (e, name, kind) => {
   const s = S(e);

@@ -27,10 +27,11 @@ the background and install when you restart. **Help > Check for Updates** checks
 - Row numbering (I. A. 1. a., 1.1.1, or 1. on each level).
 - Themes (Standard, Paper, Ocean, Forest, Mono) that follow Windows light and dark mode,
   or can be forced light or dark.
-- Sidebar: jump to and focus on a section, saved filters, named styles, and every Find match.
+- Sidebar: jump to and focus on a section (Ctrl+click to focus on several), saved filters, named styles,
+  and every Find match.
 - Filters: by text, by checkbox, and by column values (Owner contains, Due in the next 7 days,
   Estimate > 2h...). Save them in the sidebar and edit them later (Ctrl+Shift+G).
-- Focus on a section (Ctrl+Shift+F), Find and Replace with all results listed in the sidebar.
+- Focus on the selected sections (Ctrl+Shift+F), Find and Replace with all results listed in the sidebar.
 - Attach files by dragging them onto a row; images show inline and resize by dragging the corner.
 - Record audio into a row (Ctrl+Shift+R); it plays in the outline and is saved next to the file.
 - Links to a row (`arbor://` links, Edit > Copy Link to Row).
@@ -40,7 +41,8 @@ the background and install when you restart. **Help > Check for Updates** checks
 - Several windows, including a second window on the same outline (View > New Window on This Outline).
 - Automation console with a small JavaScript API (Automation menu).
 - OPML mode: an .opml file opens and saves as OPML, so other outliners can keep using it.
-- Open and import OPML, Markdown, plain text and RTF; export OPML, Markdown, text, RTF,
+- Open and import OPML, Markdown, plain text, RTF, Word (headings and lists become rows, tables become
+  columns) and PowerPoint (a row per slide, bullets inside it, speaker notes as its note); export OPML, Markdown, text, RTF,
   Excel, Word, PowerPoint, HTML, CSV and PDF; print.
 - Saves automatically once a file has a name; undo and redo for every change;
   reopens the outlines you had open last time; spell check.

@@ -23,7 +23,7 @@ function h(tag, props = {}, ...kids) {
 
 const state = {
   doc: M.newDoc(), path: null, dirty: false, pristine: true, version: 0,
-  sel: new Set(), anchor: null, head: null, focusId: null, filter: { text: '', status: 'all', rules: [] },
+  sel: new Set(), anchor: null, head: null, focusIds: [], filter: { text: '', status: 'all', rules: [] },
   undo: [], redo: [], editing: false, pendingFocus: null, noteOpen: new Set(), clip: null, drag: null,
   sidebar: true, inspector: true, zen: false, inspectorTab: 'document', flashCol: null,
   find: { idx: -1, matches: [] },
@@ -154,7 +154,7 @@ const visibleCols = () => state.doc.columns.filter(c => !c.hidden);
 const gridTemplate = cols => ['minmax(180px, 1fr)'].concat(cols.map(c => c.width + 'px')).join(' ');
 const activeRules = () => (state.filter.rules || []).filter(r => state.doc.columns.some(c => c.id === r.col));
 const filtering = () => !!state.filter.text.trim() || state.filter.status !== 'all' || activeRules().length > 0;
-const visibleOpts = () => ({ focusId: state.focusId, text: state.filter.text, status: state.filter.status, rules: state.filter.rules });
+const visibleOpts = () => ({ focusIds: state.focusIds, text: state.filter.text, status: state.filter.status, rules: state.filter.rules });
 
 function renderOutline() {
   const d = state.doc;
@@ -164,10 +164,11 @@ function renderOutline() {
   const header = $('#header');
   header.hidden = !cols.length;
   header.replaceChildren(h('div', {}, 'Topic'), ...cols.map(headerCell));
-  if (state.focusId && !M.find(d, state.focusId)) state.focusId = null;
-  const fb = $('#focusbar'), fr = state.focusId && M.find(d, state.focusId).row;
-  fb.hidden = !fr;
-  if (fr) fb.replaceChildren(h('span', {}, 'Focused on: ' + (fr.text || 'Untitled row')), h('button', { onclick: () => cmd.unfocus() }, 'Show entire outline'));
+  state.focusIds = M.topLevel(d, state.focusIds); // drop deleted rows and rows inside another focused row
+  const fb = $('#focusbar'), fr = focusRows();
+  fb.hidden = !fr.length;
+  if (fr.length) fb.replaceChildren(h('span', {}, (fr.length > 1 ? `Focused on ${fr.length} sections: ` : 'Focused on: ') + fr.map(r => r.text || 'Untitled row').join(', ')),
+    h('button', { onclick: () => cmd.unfocus() }, 'Show entire outline'));
   const vis = M.visibleRows(d, visibleOpts());
   $('#filterBtn').classList.toggle('on', activeRules().length > 0);
   const paths = M.numberPaths(d);
@@ -358,10 +359,11 @@ function renderSidebar() {
   const d = state.doc, f = state.filter;
   const item = (label, active, onclick, cls = '', extra = null, style = '') =>
     h('div', { class: 'item ' + cls + (active ? ' active' : ''), title: label, onclick }, h('span', { style }, label), extra);
-  const kids = [h('h4', {}, 'Outline'), item('Entire outline', !state.focusId, () => cmd.unfocus())];
+  const focused = new Set(state.focusIds);
+  const kids = [h('h4', { title: 'Click a section to focus on it. Ctrl+click to focus on several.' }, 'Outline'), item('Entire outline', !focused.size, () => cmd.unfocus())];
   for (const r of d.root.children) {
-    kids.push(item(r.text || 'Untitled row', state.focusId === r.id, () => focusOn(r.id)));
-    for (const c of r.children) if (c.children.length) kids.push(item(c.text || 'Untitled row', state.focusId === c.id, () => focusOn(c.id), 'sub'));
+    kids.push(item(r.text || 'Untitled row', focused.has(r.id), e => focusOn(r.id, e.ctrlKey || e.shiftKey)));
+    for (const c of r.children) if (c.children.length) kids.push(item(c.text || 'Untitled row', focused.has(c.id), e => focusOn(c.id, e.ctrlKey || e.shiftKey), 'sub'));
   }
   const results = findResultsEl();
   if (results) kids.unshift(...results);
@@ -388,7 +390,14 @@ function renderSidebar() {
   }
   $('#sidebar').replaceChildren(...kids);
 }
-function focusOn(id) { state.focusId = id; render(); }
+// Ctrl+click adds a section to the focus (or takes it out again).
+function focusOn(id, add) {
+  if (!add) state.focusIds = [id];
+  else state.focusIds = state.focusIds.includes(id) ? state.focusIds.filter(x => x !== id) : state.focusIds.concat(id);
+  render();
+}
+const focusRows = () => state.focusIds.map(id => M.find(state.doc, id)).filter(Boolean).map(f => f.row);
+const focusRoot = d => { const f = state.focusIds[0] && M.find(d, state.focusIds[0]); return f ? f.row : d.root; };
 function setFilter(text, status, rules = []) {
   state.filter = { text, status, rules }; $('#filter').value = text; $('#statusFilter').value = status;
   renderOutline(); renderSidebar(); renderStatus();
@@ -556,7 +565,7 @@ function stylePane() {
 function sortBy(colId, dir) {
   const id = targets()[0];
   change(d => {
-    let parent = state.focusId ? M.find(d, state.focusId).row : d.root;
+    let parent = focusRoot(d);
     if (id) { const f = M.find(d, id); parent = f.row.children.length ? f.row : f.parent; }
     M.sortChildren(d, parent, colId, dir);
   });
@@ -620,7 +629,7 @@ function flash(msg) { flashMsg = msg; renderStatus(); clearTimeout(flashTimer); 
 function renderStatus() {
   const s = M.stats(state.doc), parts = [`${s.rows} rows`, `${s.words} words`];
   if (state.doc.statusVisible) parts.push(`${s.checked} of ${s.leaves} checked`);
-  if (state.focusId) parts.push('Focused');
+  if (state.focusIds.length) parts.push(state.focusIds.length > 1 ? `Focused on ${state.focusIds.length} sections` : 'Focused');
   if (filtering()) parts.push('Filtered: ' + describeFilter(state.filter));
   if (state.mirrored) parts.push('Shown in another window');
   const saved = flashMsg || (state.path ? (state.dirty ? 'Saving…' : 'Saved') : state.pristine ? '' : 'Not saved yet');
@@ -659,16 +668,19 @@ async function save(as = false) {
   return true;
 }
 function setDoc(doc, path) {
-  Object.assign(state, { doc, path, undo: [], redo: [], sel: new Set(), focusId: null, filter: { text: '', status: 'all', rules: [] },
+  Object.assign(state, { doc, path, undo: [], redo: [], sel: new Set(), focusIds: [], filter: { text: '', status: 'all', rules: [] },
     noteOpen: new Set(), dirty: false, pristine: !path, editing: false });
   $('#filter').value = ''; $('#statusFilter').value = 'all';
   host.setDirty(false); lastDirty = false; host.setPath(path);
   render(); focusFirst();
 }
-function loadContent(path, content) {
+async function loadContent(path, content) {
   const ext = (path.split('.').pop() || '').toLowerCase(), name = baseName(path);
   let doc, native = false;
   try {
+    if (ext === 'docx') doc = await Office.fromDOCX(content, name);
+    else if (ext === 'pptx') doc = await Office.fromPPTX(content, name);
+    else
     if (ext === 'arbor' || ext === 'json') { doc = M.normalize(JSON.parse(content)); native = true; }
     else if (ext === 'opml') { doc = M.normalize(M.fromOPML(content)); native = !importing; }
     else if (ext === 'xml') doc = M.fromOPML(content);
@@ -681,7 +693,7 @@ function loadContent(path, content) {
   if (!native) { state.pristine = false; touched(); }
 }
 let importing = false; // File > Import makes a new, unsaved outline even from an .opml file
-function openContent(path, content) { if (state.pristine || host.web) loadContent(path, content); else host.openInNewWindow(path); }
+function openContent(path, content) { if (state.pristine || host.web) return loadContent(path, content); host.openInNewWindow(path); }
 const Office = window.Office;
 const EXPORTS = { opml: ['opml', M.toOPML], markdown: ['md', M.toMarkdown], text: ['txt', M.toText], html: ['html', M.toHTML], csv: ['csv', M.toCSV],
   rtf: ['rtf', Office.toRTF], xlsx: ['xlsx', Office.toXLSX], docx: ['docx', Office.toDOCX], pptx: ['pptx', Office.toPPTX] };
@@ -736,7 +748,7 @@ function reveal(id, fld = 'topic') {
   const d = state.doc; if (!M.find(d, id)) return;
   const anc = M.ancestors(d, id);
   anc.forEach(a => { a.collapsed = false; });
-  if (state.focusId && state.focusId !== id && !anc.some(a => a.id === state.focusId)) state.focusId = null;
+  if (state.focusIds.length && !state.focusIds.some(f => f === id || anc.some(a => a.id === f))) state.focusIds = [];
   if (filtering() && !M.visibleRows(d, visibleOpts()).some(v => v.row.id === id)) setFilter('', 'all');
   if (fld === 'note') { state.noteOpen.add(id); d.notesVisible = true; }
   renderOutline(); renderSidebar();
@@ -769,7 +781,7 @@ function pasteRows(text, afterId) {
   change(d => {
     const f = afterId && M.find(d, afterId);
     if (f && !f.row.text && !f.row.note && !f.row.children.length) f.parent.children.splice(f.index, 1, ...rows);
-    else M.insertRows(d, afterId, rows, !afterId && state.focusId ? state.focusId : null);
+    else M.insertRows(d, afterId, rows, !afterId && state.focusIds.length ? state.focusIds[0] : null);
     state.sel = new Set(rows.map(r => r.id));
   });
 }
@@ -794,9 +806,9 @@ function newRow({ before = false, child = false } = {}) {
   state.pendingFocus = { id: r.id, field: 'topic', caret: 'end' };
   change(d => {
     const f = id && M.find(d, id);
-    if (!f) (state.focusId ? M.find(d, state.focusId).row : d.root).children.push(r);
+    if (!f) focusRoot(d).children.push(r);
     else if (child) { f.row.children.push(r); f.row.collapsed = false; }
-    else if (id === state.focusId || (!before && f.row.children.length && !f.row.collapsed)) { f.row.children.unshift(r); f.row.collapsed = false; }
+    else if (state.focusIds.includes(id) || (!before && f.row.children.length && !f.row.collapsed)) { f.row.children.unshift(r); f.row.collapsed = false; }
     else f.parent.children.splice(f.index + (before ? 0 : 1), 0, r);
     state.sel = new Set([r.id]); state.anchor = r.id;
   });
@@ -833,7 +845,7 @@ function toggleStyle(k) {
 }
 function setCollapsed(on, all) {
   viewChange(d => {
-    if (all) M.walk(state.focusId ? M.find(d, state.focusId).row : d.root, r => { if (r.children.length) r.collapsed = on; });
+    if (all) (state.focusIds.length ? focusRows() : [d.root]).forEach(top => M.walk(top, r => { if (r.children.length) r.collapsed = on; }));
     else targets().forEach(id => { const r = M.find(d, id).row; if (r.children.length) r.collapsed = on; });
   });
 }
@@ -936,7 +948,7 @@ const cmd = {
   undo, redo,
   newRow: () => newRow(), newRowAbove: () => newRow({ before: true }), newChild: () => newRow({ child: true }),
   indent: () => change(d => M.indent(d, targets())),
-  outdent: () => change(d => M.outdent(d, targets(), state.focusId)),
+  outdent: () => change(d => M.outdent(d, targets(), state.focusIds)),
   moveUp: () => change(d => M.moveUp(d, targets())),
   moveDown: () => change(d => M.moveDown(d, targets())),
   toggleStatus() {
@@ -947,8 +959,12 @@ const cmd = {
   duplicate() { const ids = targets(); if (ids.length) change(d => { state.sel = new Set(M.duplicate(d, ids)); }); },
   collapse: () => setCollapsed(true, false), expand: () => setCollapsed(false, false),
   collapseAll: () => setCollapsed(true, true), expandAll: () => setCollapsed(false, true),
-  focus() { const id = targets()[0]; if (!id) return; state.focusId = state.focusId === id ? null : id; render(); },
-  unfocus() { state.focusId = null; render(); },
+  // Focus on every selected row (Ctrl+Shift+F again on the same rows shows everything).
+  focus() {
+    const ids = M.topLevel(state.doc, targets()); if (!ids.length) return;
+    state.focusIds = ids.join() === state.focusIds.join() ? [] : ids; render();
+  },
+  unfocus() { state.focusIds = []; render(); },
   toggleNote() {
     const a = document.activeElement;
     if (a && a.classList.contains('note')) return focusField(a.closest('.row').dataset.id, 'topic');
@@ -1006,7 +1022,7 @@ const cmd = {
   },
   newDoc: () => host.newWindow(),
   template(key) { if (state.pristine || host.web) setDoc(M.fromTemplate(key), null); else host.newWindow(key); },
-  async open(kind) { const f = await host.openDialog(kind || 'all'); if (f) openContent(f.path, f.content); },
+  async open(kind) { const f = await host.openDialog(kind || 'all'); if (f) await openContent(f.path, f.content); },
   async import(kind) { importing = true; try { await cmd.open(kind); } finally { importing = false; } },
   filterEditor: () => filterEditor(),
   clearFilter: () => setFilter('', 'all'),
@@ -1215,13 +1231,13 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', async e => {
   e.preventDefault();
   for (const f of e.dataTransfer.files) {
-    if (!/\.(arbor|opml|md|markdown|txt|rtf)$/i.test(f.name)) continue;
+    if (!/\.(arbor|opml|md|markdown|txt|rtf|docx|pptx)$/i.test(f.name)) continue;
     const p = host.pathForFile(f);
-    if (p && !host.web) host.openInNewWindow(p); else openContent(f.name, await f.text());
+    if (p && !host.web) host.openInNewWindow(p); else openContent(f.name, /\.(docx|pptx)$/i.test(f.name) ? new Uint8Array(await f.arrayBuffer()) : await f.text());
   }
 });
 host.onMenu(run);
-host.onLoad(({ path, content, reveal: rid }) => { loadContent(path, content); if (rid) { reveal(rid); selectOnly(rid); } });
+host.onLoad(async ({ path, content, reveal: rid }) => { await loadContent(path, content); if (rid) { reveal(rid); selectOnly(rid); } });
 host.onReveal(id => { reveal(id); selectOnly(id); });
 if (host.onShortcuts) host.onShortcuts(applyShortcuts);
 if (host.onSync) host.onSync(receiveSync);
@@ -1234,7 +1250,7 @@ window.__arbor = { state, cmd, run, M, loadContent, save, setDoc, runScript, app
 function webShim() {
   const pickFile = accept => new Promise(res => {
     const i = document.createElement('input'); i.type = 'file'; i.accept = accept;
-    i.onchange = async () => { const f = i.files[0]; res(f ? { path: f.name, content: await f.text() } : null); };
+    i.onchange = async () => { const f = i.files[0]; res(f ? { path: f.name, content: /\.(docx|pptx)$/i.test(f.name) ? new Uint8Array(await f.arrayBuffer()) : await f.text() } : null); };
     i.click();
   });
   const download = (name, content) => {
@@ -1245,7 +1261,7 @@ function webShim() {
   return {
     web: true, onMenu: none, onLoad: none, onReveal: none, setDirty: none, setPath: none,
     setFullScreen: on => { if (on && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(none); else if (!on && document.fullscreenElement) document.exitFullscreen(); },
-    openDialog: () => pickFile('.arbor,.opml,.md,.markdown,.txt,.json,.rtf'),
+    openDialog: () => pickFile('.arbor,.opml,.md,.markdown,.txt,.json,.rtf,.docx,.pptx'),
     saveDialog: async name => name, writeFile: async (p, c) => download(p, c),
     exportPDF: async () => { window.print(); return null; }, print: () => window.print(),
     openExternal: u => window.open(u, '_blank', 'noopener'), openPath: none, pathForFile: () => '',

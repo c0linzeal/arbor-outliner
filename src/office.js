@@ -312,5 +312,240 @@
     return doc;
   }
 
-  return { zip, crc32, toXLSX, toDOCX, toPPTX, toRTF, fromRTF };
+  // ---- reading Office files ----
+  // Zip entries are inflated with the platform's own DecompressionStream (browser and Node).
+  function unzip(bytes) {
+    const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    let end = -1;
+    for (let i = b.length - 22; i >= Math.max(0, b.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { end = i; break; }
+    if (end < 0) throw new Error('The file is damaged or is not an Office document.');
+    const entries = {}, dec = new TextDecoder();
+    let p = dv.getUint32(end + 16, true);
+    for (let n = dv.getUint16(end + 10, true); n > 0 && dv.getUint32(p, true) === 0x02014b50; n--) {
+      const method = dv.getUint16(p + 10, true), size = dv.getUint32(p + 20, true), local = dv.getUint32(p + 42, true);
+      const nl = dv.getUint16(p + 28, true), name = dec.decode(b.subarray(p + 46, p + 46 + nl));
+      p += 46 + nl + dv.getUint16(p + 30, true) + dv.getUint16(p + 32, true);
+      const start = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
+      entries[name] = { method, data: b.subarray(start, start + size) };
+    }
+    return async name => {
+      const e = entries[name.replace(/^\//, '')];
+      if (!e) return null;
+      if (e.method === 0) return dec.decode(e.data);
+      if (e.method !== 8) throw new Error('The file uses a kind of compression Arbor cannot read.');
+      return new Response(new Blob([e.data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+    };
+  }
+  // A small XML reader: elements are { name, attrs, kids }, text is a string.
+  const unXml = s => s.replace(/&(#x[0-9a-f]+|#\d+|lt|gt|quot|apos|amp);/gi, (_, e) => {
+    const k = e.toLowerCase();
+    return k[0] === '#' ? String.fromCodePoint(k[1] === 'x' ? parseInt(k.slice(2), 16) : parseInt(k.slice(1), 10)) : { lt: '<', gt: '>', quot: '"', apos: "'", amp: '&' }[k];
+  });
+  function parseXml(xml) {
+    const root = { name: '#root', attrs: {}, kids: [] }, stack = [root];
+    const re = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[([\s\S]*?)\]\]>|<(\/?)([\w:.-]+)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>|([^<]+)/g;
+    let m;
+    while ((m = re.exec(xml || ''))) {
+      const top = stack[stack.length - 1];
+      if (m[1] !== undefined) top.kids.push(m[1]);
+      else if (m[3]) {
+        if (m[2]) { if (stack.length > 1) stack.pop(); continue; }
+        const el = { name: m[3], attrs: {}, kids: [] };
+        m[4].replace(/([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g, (_, k, a, c) => { el.attrs[k] = unXml(a !== undefined ? a : c); });
+        top.kids.push(el);
+        if (!m[5]) stack.push(el);
+      } else if (m[6] !== undefined) top.kids.push(unXml(m[6]));
+    }
+    return root;
+  }
+  const els = n => n ? n.kids.filter(k => typeof k !== 'string') : [];
+  function all(n, name, out = []) { for (const k of els(n)) { if (k.name === name) out.push(k); all(k, name, out); } return out; }
+  function first(n, name) { for (const k of els(n)) { if (k.name === name) return k; const f = first(k, name); if (f) return f; } return null; }
+  const val = (n, a = 'w:val') => n ? n.attrs[a] : undefined;
+  function readRels(xml, base) { // relationship id -> { target (full zip path), type }
+    const out = {};
+    for (const r of all(parseXml(xml), 'Relationship')) {
+      let t = r.attrs.Target || '';
+      if (r.attrs.TargetMode === 'External') continue;
+      const parts = (t.startsWith('/') ? t.slice(1) : base + t).split('/'), path = [];
+      for (const s of parts) { if (s === '..') path.pop(); else if (s && s !== '.') path.push(s); }
+      out[r.attrs.Id] = { target: path.join('/'), type: r.attrs.Type || '' };
+    }
+    return out;
+  }
+  const relsFor = p => p.replace(/([^/]+)$/, '_rels/$1.rels');
+  const dirOf = p => p.replace(/[^/]+$/, '');
+  // Bullets and numbers our own exports (and many documents) put in front of a row, before a tab.
+  const MARK = /^(?:[•●◦▪■☐☑☒–-]|\d+(?:\.\d+)*[.)]?|[ivxlcdm]+\.|[a-z]{1,3}\.)\t/i;
+  function takeBox(text) { // "☑ Pack" -> { text: 'Pack', boxed: true, checked: true }
+    const m = /^([☐☑☒])[\s\t]*/.exec(text);
+    return m ? { text: text.slice(m[0].length), boxed: true, checked: m[1] !== '☐' } : { text, boxed: false, checked: false };
+  }
+
+  // Builds an outline from entries in reading order: { key, text, note?, checked?, values? }
+  // where a larger key sits inside a smaller one, and { note } entries attach to the row above.
+  function assemble(items, title, columns) {
+    const doc = M.newDoc(title || 'Untitled'), stack = [];
+    doc.root.children = []; doc.columns = columns || [];
+    let last = null;
+    for (const it of items) {
+      if (it.kind === 'note') {
+        if (last) last.note = last.note ? last.note + '\n' + it.text : it.text;
+        else { last = M.row(it.text); doc.root.children.push(last); }
+        continue;
+      }
+      const r = M.row(it.text);
+      if (it.checked) r.state = true;
+      if (it.values) r.values = it.values;
+      while (stack.length && stack[stack.length - 1].key >= it.key) stack.pop();
+      (stack.length ? stack[stack.length - 1].row : doc.root).children.push(r);
+      stack.push({ key: it.key, row: r }); last = r;
+    }
+    doc.statusVisible = items.some(i => i.boxed);
+    for (const c of doc.columns) { const ty = M.guessType(M.allRows(doc).map(r => r.values[c.id] || '')); if (ty !== 'text') M.convertColumn(doc, c, ty); }
+    if (!doc.root.children.length) doc.root.children.push(M.row(''));
+    return doc;
+  }
+
+  // ---- Word: headings and list levels become rows; body text becomes notes ----
+  async function fromDOCX(bytes, fallbackTitle) {
+    const read = unzip(bytes);
+    const body = first(parseXml(await read('word/document.xml')), 'w:body');
+    if (!body) throw new Error('The file has no document in it.');
+    const styles = {}; // style id -> { heading, list, title }
+    for (const st of all(parseXml(await read('word/styles.xml')), 'w:style')) {
+      const name = (val(first(st, 'w:name')) || '').toLowerCase(), ol = val(first(st, 'w:outlineLvl'));
+      const hm = /^heading\s*(\d)$/.exec(name), lm = /^list (?:bullet|number)\s*(\d)?$/.exec(name);
+      styles[st.attrs['w:styleId']] = { heading: hm ? +hm[1] - 1 : ol !== undefined && +ol < 9 ? +ol : undefined,
+        // "List Bullet 2" is the second level, whatever its numbering definition says
+        list: lm ? (lm[1] ? +lm[1] - 1 : 0) : first(st, 'w:numPr') ? +(val(first(st, 'w:ilvl')) || 0) : undefined, title: name === 'title' };
+    }
+    const runText = (n, out) => {
+      for (const k of els(n)) {
+        if (k.name === 'w:t') out.push(k.kids.filter(x => typeof x === 'string').join(''));
+        else if (k.name === 'w:tab') out.push('\t');
+        else if (k.name === 'w:br' || k.name === 'w:cr') out.push('\n');
+        else if (k.name === 'w:noBreakHyphen') out.push('-');
+        else if (!['w:pPr', 'w:rPr', 'w:del', 'w:delText', 'w:instrText', 'w:footnoteReference', 'mc:Fallback'].includes(k.name)) runText(k, out);
+      }
+      return out;
+    };
+    const paraInfo = p => {
+      const pPr = els(p).find(k => k.name === 'w:pPr'), st = styles[val(pPr && els(pPr).find(k => k.name === 'w:pStyle'))] || {};
+      const numPr = pPr && first(pPr, 'w:numPr'), ind = pPr && first(pPr, 'w:ind');
+      const left = +(val(ind, 'w:left') || val(ind, 'w:start') || 0);
+      const outline = pPr && val(first(pPr, 'w:outlineLvl'));
+      return { text: runText(p, []).join(''), heading: outline !== undefined && +outline < 9 ? +outline : st.heading, title: st.title,
+        list: numPr && first(numPr, 'w:ilvl') ? +val(first(numPr, 'w:ilvl')) : st.list !== undefined ? st.list : numPr ? 0 : undefined, left };
+    };
+    let title = '';
+    const items = [], columns = [];
+    const blocks = n => els(n).flatMap(k => k.name === 'w:sdt' ? blocks(first(k, 'w:sdtContent')) : [k]);
+    for (const b of blocks(body)) {
+      if (b.name === 'w:p') {
+        const p = paraInfo(b);
+        if (!p.text.trim()) continue;
+        if (p.title && !title) { title = p.text.trim(); continue; }
+        if (p.heading !== undefined) { items.push({ key: p.heading, text: p.text.trim() }); continue; }
+        if (p.list !== undefined || MARK.test(p.text)) {
+          const bx = takeBox(p.text.replace(MARK, '').replace(/\t/g, ' ').trim());
+          const lvl = p.list !== undefined ? p.list : Math.max(0, Math.round(p.left / 360) - 1);
+          items.push({ key: 100 + lvl, text: bx.text, boxed: bx.boxed || /^☐|^[☑☒]/.test(p.text), checked: bx.checked || /^[☑☒]/.test(p.text) });
+          continue;
+        }
+        items.push({ kind: 'plain', text: p.text.trim() });
+      } else if (b.name === 'w:tbl') {
+        // A table: the first row names the columns, the first cell of each row is the row's text
+        // (indented cells, as Arbor writes them, give the level), other cells fill the columns.
+        const trs = all(b, 'w:tr');
+        if (!trs.length) continue;
+        const cellsOf = tr => els(tr).filter(k => k.name === 'w:tc');
+        const head = cellsOf(trs[0]).map(tc => all(tc, 'w:p').map(p => paraInfo(p).text).join(' ').trim());
+        const cols = head.slice(1).map((n, i) => { const c = M.column(n || 'Column ' + (i + 1), 'text'); columns.push(c); return c; });
+        for (const tr of trs.slice(1)) {
+          const cells = cellsOf(tr); if (!cells.length) continue;
+          const ps = all(cells[0], 'w:p').map(paraInfo).filter(p => p.text.trim());
+          if (!ps.length && cells.slice(1).every(tc => !all(tc, 'w:p').some(p => paraInfo(p).text.trim()))) continue;
+          const bx = takeBox((ps[0] ? ps[0].text : '').trim());
+          const values = {};
+          cols.forEach((c, i) => { const v = cells[i + 1] ? all(cells[i + 1], 'w:p').map(p => paraInfo(p).text).join('\n').trim() : ''; if (v) values[c.id] = v; });
+          items.push({ key: 200 + Math.round((ps[0] ? ps[0].left : 0) / 280), text: bx.text, boxed: bx.boxed, checked: bx.checked, values });
+          if (ps.length > 1) items.push({ kind: 'note', text: ps.slice(1).map(p => p.text.trim()).join('\n') });
+        }
+      }
+    }
+    // With headings or lists, plain paragraphs are notes on the row above; a plain document gets a row per paragraph.
+    const structured = items.some(i => i.kind !== 'plain');
+    for (const it of items) if (it.kind === 'plain') { if (structured) it.kind = 'note'; else { delete it.kind; it.key = 0; } }
+    if (!title) title = ((await read('docProps/core.xml') || '').match(/<dc:title>([^<]*)<\/dc:title>/) || [])[1] || '';
+    return assemble(items, unXml(title).trim() || fallbackTitle, columns);
+  }
+
+  // ---- PowerPoint: each slide is a row, its bullets are rows inside it, speaker notes become its note ----
+  async function fromPPTX(bytes, fallbackTitle) {
+    const read = unzip(bytes);
+    const pres = parseXml(await read('ppt/presentation.xml'));
+    if (!first(pres, 'p:presentation')) throw new Error('The file has no presentation in it.');
+    const presRels = readRels(await read('ppt/_rels/presentation.xml.rels'), 'ppt/');
+    const slides = all(pres, 'p:sldId').map(s => presRels[s.attrs['r:id']]).filter(Boolean).map(r => r.target);
+    const paras = sp => all(first(sp, 'p:txBody'), 'a:p').map(p => {
+      const pPr = els(p).find(k => k.name === 'a:pPr');
+      const out = [];
+      const walk = n => { for (const k of els(n)) { if (k.name === 'a:t') out.push(k.kids.filter(x => typeof x === 'string').join('')); else if (k.name === 'a:br') out.push('\n'); else if (k.name === 'a:tab') out.push('\t'); else if (k.name !== 'a:pPr' && k.name !== 'a:rPr') walk(k); } };
+      walk(p);
+      const marL = pPr && pPr.attrs.marL !== undefined ? +pPr.attrs.marL : null;
+      const lvl = pPr && pPr.attrs.lvl !== undefined ? +pPr.attrs.lvl : marL ? Math.max(0, Math.round(marL / 342900) - 1) : 0;
+      const bu = pPr && first(pPr, 'a:buChar');
+      return { text: out.join(''), lvl, none: !!(pPr && first(pPr, 'a:buNone')), char: bu ? bu.attrs.char : '' };
+    }).filter(p => p.text.trim());
+    const items = [];
+    let title = '';
+    for (let i = 0; i < slides.length; i++) {
+      const path = slides[i], x = parseXml(await read(path));
+      if (!first(x, 'p:sld')) continue;
+      let head = '', sub = '', isCover = false;
+      const body = [];
+      for (const sp of all(x, 'p:sp')) {
+        const ph = first(first(sp, 'p:nvSpPr'), 'p:ph'), type = ph ? ph.attrs.type || 'body' : '';
+        const name = val(first(sp, 'p:cNvPr'), 'name') || '';
+        if (['sldNum', 'dt', 'ftr', 'hdr'].includes(type)) continue;
+        const ps = paras(sp); if (!ps.length) continue;
+        if (type === 'title' || type === 'ctrTitle' || (!ph && /^title/i.test(name) && !head)) {
+          if (!head) head = ps.map(p => p.text.trim()).join(' ');
+          if (type === 'ctrTitle') isCover = true;
+        } else if (type === 'subTitle') sub = ps.map(p => p.text.trim()).join('\n');
+        else body.push(...ps);
+      }
+      if (!head && body.length) head = body.shift().text.trim();
+      if (!head) continue;
+      // The first slide is the cover when it is a title slide or has nothing but a title.
+      if (i === 0 && !title && (isCover || !body.length)) { title = head; if (sub) items.push({ kind: 'note-cover', text: sub }); continue; }
+      items.push({ key: 0, text: head });
+      for (const p of body) {
+        if (p.none) { items.push({ kind: 'note', text: p.text.trim() }); continue; }
+        const bx = takeBox((p.char && /[☐-☒]/.test(p.char) ? p.char + ' ' : '') + p.text.replace(MARK, '').trim());
+        items.push({ key: 1 + p.lvl, text: bx.text, boxed: bx.boxed, checked: bx.checked });
+      }
+      if (sub) items.push({ kind: 'note', text: sub });
+      // Speaker notes
+      const notes = Object.values(readRels(await read(relsFor(path)), dirOf(path))).find(r => /\/notesSlide$/.test(r.type));
+      if (notes) {
+        const nx = parseXml(await read(notes.target));
+        const text = all(nx, 'p:sp').filter(sp => { const ph = first(sp, 'p:ph'); return ph && (ph.attrs.type || 'body') === 'body'; })
+          .flatMap(paras).map(p => p.text.trim()).join('\n');
+        if (text) {
+          const slideRow = items.filter(it => it.key === 0 && it.kind === undefined).pop();
+          slideRow.note = slideRow.note ? slideRow.note + '\n' + text : text;
+        }
+      }
+    }
+    const doc = assemble(items.filter(it => it.kind !== 'note-cover'), title || fallbackTitle);
+    // Speaker notes go on the slide rows (assemble only knows notes that follow a row).
+    const slideNotes = items.filter(it => it.key === 0 && it.kind === undefined).map(it => it.note || '');
+    doc.root.children.forEach((r, i) => { if (slideNotes[i]) r.note = r.note ? r.note + '\n' + slideNotes[i] : slideNotes[i]; });
+    return doc;
+  }
+
+  return { zip, crc32, toXLSX, toDOCX, toPPTX, toRTF, fromRTF, fromDOCX, fromPPTX, unzip, parseXml };
 });

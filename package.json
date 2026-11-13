@@ -1,7 +1,7 @@
 {
   "name": "arbor-outliner",
   "productName": "Arbor Outliner",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "An outliner for Windows: rows, columns, checkboxes, styles, notes, focus and filters.",
   "main": "main.js",
   "author": "Arbor Outliner",
