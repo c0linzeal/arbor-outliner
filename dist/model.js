@@ -103,8 +103,42 @@
   function setStatus(r, checked) { r.state = checked; r.children.forEach(c => setStatus(c, checked)); }
 
   // ---- visible rows (collapse, focus, filter) ----
-  function matchesFilter(doc, r, q, status) {
+  // Column conditions for filters, by column type: [op, label, needs a value]
+  const RULE_OPS = {
+    text: [['contains', 'contains', 1], ['is', 'is', 1], ['not', 'is not', 1], ['empty', 'is empty', 0], ['filled', 'is not empty', 0]],
+    popup: [['is', 'is', 1], ['not', 'is not', 1], ['empty', 'is empty', 0], ['filled', 'is not empty', 0]],
+    number: [['eq', '=', 1], ['ne', '≠', 1], ['lt', '<', 1], ['le', '≤', 1], ['gt', '>', 1], ['ge', '≥', 1], ['empty', 'is empty', 0], ['filled', 'is not empty', 0]],
+    duration: [['eq', '=', 1], ['lt', '<', 1], ['gt', '>', 1], ['empty', 'is empty', 0], ['filled', 'is not empty', 0]],
+    date: [['on', 'is on', 1], ['before', 'is before', 1], ['after', 'is after', 1], ['next', 'is in the next … days', 1], ['past', 'is past (before today)', 0], ['empty', 'is empty', 0], ['filled', 'is not empty', 0]],
+    checkbox: [['checked', 'is checked', 0], ['unchecked', 'is not checked', 0]],
+  };
+  const isoToday = (now = new Date()) => new Date(now.getTime() - now.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
+  function matchRule(doc, r, rule) {
+    const col = doc.columns.find(c => c.id === rule.col); if (!col) return true;
+    const v = cellValue(doc, r, col).value, empty = v === undefined || v === null || v === '';
+    const op = rule.op;
+    if (op === 'empty') return empty;
+    if (op === 'filled') return !empty;
+    if (col.type === 'checkbox') return op === 'checked' ? v === true : v !== true;
+    if (col.type === 'text' || col.type === 'popup') {
+      const a = String(empty ? '' : v).toLowerCase(), b = String(rule.value || '').toLowerCase();
+      return op === 'contains' ? a.includes(b) : op === 'is' ? a === b : op === 'not' ? a !== b : true;
+    }
+    if (col.type === 'date') {
+      const today = isoToday();
+      if (op === 'past') return !empty && v < today;
+      if (empty) return false;
+      if (op === 'next') { const end = isoToday(new Date(Date.now() + (parseInt(rule.value, 10) || 0) * 864e5)); return v >= today && v <= end; }
+      const b = parseValue(col, rule.value); if (!b) return true;
+      return op === 'on' ? v === b : op === 'before' ? v < b : op === 'after' ? v > b : true;
+    }
+    if (empty) return op === 'ne';
+    const b = parseValue(col, rule.value); if (b === undefined) return true;
+    return { eq: v === b, ne: v !== b, lt: v < b, le: v <= b, gt: v > b, ge: v >= b }[op] !== false;
+  }
+  function matchesFilter(doc, r, q, status, rules) {
     if (status && status !== 'all' && (status === 'checked') !== (statusOf(r) === 'checked')) return false;
+    if (rules && !rules.every(rule => matchRule(doc, r, rule))) return false;
     if (!q) return true;
     const vals = doc.columns.map(c => formatValue(c, r.values[c.id])).join(' ');
     return (r.text + '\n' + r.note + '\n' + vals).toLowerCase().includes(q);
@@ -113,11 +147,12 @@
     const out = [];
     const q = (opts.text || '').trim().toLowerCase();
     const status = opts.status || 'all';
-    const filtering = !!q || status !== 'all';
+    const rules = (opts.rules || []).filter(x => doc.columns.some(c => c.id === x.col));
+    const filtering = !!q || status !== 'all' || rules.length > 0;
     const memo = new Map();
     const keep = r => {
       if (memo.has(r.id)) return memo.get(r.id);
-      const k = matchesFilter(doc, r, q, status) || r.children.some(keep);
+      const k = matchesFilter(doc, r, q, status, rules) || r.children.some(keep);
       memo.set(r.id, k);
       return k;
     };
@@ -561,7 +596,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #e5e5e5;
 
   return {
     uid, row, column, newDoc, normalize, walk, find, ancestors, contains, topLevel, allRows,
-    statusOf, setStatus, visibleRows, indent, outdent, moveUp, moveDown, deleteRows, duplicate, moveTo, insertRows, clone,
+    statusOf, setStatus, visibleRows, matchRule, RULE_OPS, indent, outdent, moveUp, moveDown, deleteRows, duplicate, moveTo, insertRows, clone,
     parseDuration, formatDuration, parseValue, formatValue, cellValue, setCheckboxCell, convertColumn, sortChildren,
     prefix, numberPaths, resolveStyle, styleCss, stats,
     toOPML, fromOPML, toMarkdown, fromMarkdown, toText, fromText, rowsToText, toCSV, toHTML,

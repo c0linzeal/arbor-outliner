@@ -23,11 +23,17 @@ function h(tag, props = {}, ...kids) {
 
 const state = {
   doc: M.newDoc(), path: null, dirty: false, pristine: true, version: 0,
-  sel: new Set(), anchor: null, head: null, focusId: null, filter: { text: '', status: 'all' },
+  sel: new Set(), anchor: null, head: null, focusId: null, filter: { text: '', status: 'all', rules: [] },
   undo: [], redo: [], editing: false, pendingFocus: null, noteOpen: new Set(), clip: null, drag: null,
   sidebar: true, inspector: true, zen: false, inspectorTab: 'document', flashCol: null,
   find: { idx: -1, matches: [] },
+  folded: pref('folded', false), typewriter: pref('typewriter', false),
+  recording: null, mirrored: false, shortcuts: {},
 };
+// Per-person view settings kept between sessions.
+function pref(k, dflt) { try { const v = localStorage.getItem('arbor.' + k); return v === null ? dflt : JSON.parse(v); } catch { return dflt; } }
+function setPref(k, v) { try { localStorage.setItem('arbor.' + k, JSON.stringify(v)); } catch { /* storage unavailable */ } }
+const isOPML = () => !!state.path && /\.opml$/i.test(state.path);
 const THEMES = [['standard', 'Standard'], ['paper', 'Paper'], ['ocean', 'Ocean'], ['forest', 'Forest'], ['mono', 'Mono']];
 const TYPE_NAMES = { text: 'Text', number: 'Number', duration: 'Duration', date: 'Date', checkbox: 'Checkbox', popup: 'Pop-up list' };
 const SUMMARY_NAMES = { none: 'None', sum: 'Total', avg: 'Average', min: 'Minimum', max: 'Maximum', hidden: 'Hide on parent rows', state: 'Checked when all are checked' };
@@ -43,7 +49,16 @@ let lastDirty = null;
 function touched() {
   state.version++; state.dirty = true; state.pristine = false;
   if (lastDirty !== true) { host.setDirty(true); lastDirty = true; }
-  updateTitle(); renderStatus(); scheduleAutosave();
+  updateTitle(); renderStatus(); scheduleAutosave(); scheduleSync();
+}
+// Other windows on the same outline get every change shortly after it happens.
+let syncTimer;
+function scheduleSync() { if (!state.mirrored || !host.syncDoc) return; clearTimeout(syncTimer); syncTimer = setTimeout(() => host.syncDoc(JSON.stringify(state.doc)), 150); }
+function receiveSync(json) {
+  clearTimeout(syncTimer);
+  state.mirrored = true; state.editing = false;
+  state.doc = JSON.parse(json); state.version++;
+  render();
 }
 function undo() {
   if (!state.undo.length) return;
@@ -131,11 +146,15 @@ function applyTheme() {
   b.classList.toggle('no-sidebar', !state.sidebar);
   b.classList.toggle('no-inspector', !state.inspector);
   b.classList.toggle('zen', state.zen);
+  b.classList.toggle('folded', state.folded);
+  b.classList.toggle('typewriter', state.typewriter);
 }
 function render() { applyTheme(); renderOutline(); renderSidebar(); renderInspector(); renderStatus(); updateTitle(); }
 const visibleCols = () => state.doc.columns.filter(c => !c.hidden);
 const gridTemplate = cols => ['minmax(180px, 1fr)'].concat(cols.map(c => c.width + 'px')).join(' ');
-const filtering = () => !!state.filter.text.trim() || state.filter.status !== 'all';
+const activeRules = () => (state.filter.rules || []).filter(r => state.doc.columns.some(c => c.id === r.col));
+const filtering = () => !!state.filter.text.trim() || state.filter.status !== 'all' || activeRules().length > 0;
+const visibleOpts = () => ({ focusId: state.focusId, text: state.filter.text, status: state.filter.status, rules: state.filter.rules });
 
 function renderOutline() {
   const d = state.doc;
@@ -149,7 +168,8 @@ function renderOutline() {
   const fb = $('#focusbar'), fr = state.focusId && M.find(d, state.focusId).row;
   fb.hidden = !fr;
   if (fr) fb.replaceChildren(h('span', {}, 'Focused on: ' + (fr.text || 'Untitled row')), h('button', { onclick: () => cmd.unfocus() }, 'Show entire outline'));
-  const vis = M.visibleRows(d, { focusId: state.focusId, text: state.filter.text, status: state.filter.status });
+  const vis = M.visibleRows(d, visibleOpts());
+  $('#filterBtn').classList.toggle('on', activeRules().length > 0);
   const paths = M.numberPaths(d);
   const rows = $('#rows');
   rows.replaceChildren(...vis.map(v => rowEl(v.row, v.depth, cols, paths)));
@@ -215,11 +235,35 @@ function noteEl(r, pad) {
 }
 
 const fileUrl = p => 'file:///' + encodeURI(p.replace(/\\/g, '/')).replace(/#/g, '%23').replace(/\?/g, '%3F');
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i, AUDIO_RE = /\.(webm|ogg|oga|mp3|m4a|wav|flac|aac)$/i;
 function attachmentsEl(r, pad) {
-  return h('div', { class: 'attachments', style: { paddingLeft: pad + 'px' } }, r.attachments.map(a => {
-    const img = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(a.path);
-    return h('span', { class: 'chip' + (img ? ' image' : ''), title: a.path + '\nClick to open', onclick: () => host.openPath(a.path) },
-      img ? h('img', { src: fileUrl(a.path), alt: a.name }) : '\u{1F4CE} ' + a.name);
+  return h('div', { class: 'attachments', style: { paddingLeft: pad + 'px' } }, r.attachments.map((a, i) => {
+    if (AUDIO_RE.test(a.path)) {
+      return h('span', { class: 'chip audio', title: a.path },
+        h('audio', { controls: true, preload: 'metadata', src: fileUrl(a.path) }),
+        h('span', { class: 'aname', title: 'Open in another app', onclick: () => host.openPath(a.path) }, a.name.replace(/\.[^.]+$/, '')));
+    }
+    if (!IMAGE_RE.test(a.path)) return h('span', { class: 'chip', title: a.path + '\nClick to open', onclick: () => host.openPath(a.path) }, '\u{1F4CE} ' + a.name);
+    // Images show inline at the size they were last given; drag the corner to resize.
+    const img = h('img', { src: fileUrl(a.path), alt: a.name, draggable: false });
+    if (a.width) img.style.width = a.width + 'px';
+    const chip = h('span', { class: 'chip image' + (a.width ? ' sized' : ''), title: a.path + '\nDouble-click to open. Drag the corner to resize.', ondblclick: () => host.openPath(a.path) }, img);
+    const grip = h('span', { class: 'resize', title: 'Drag to resize. Double-click for the original size.' });
+    grip.addEventListener('dblclick', e => { e.stopPropagation(); change(d => { delete M.find(d, r.id).row.attachments[i].width; }); });
+    grip.addEventListener('pointerdown', e => {
+      e.preventDefault(); e.stopPropagation(); grip.setPointerCapture(e.pointerId);
+      const x0 = e.clientX, w0 = img.getBoundingClientRect().width / (parseFloat(getComputedStyle(document.body).zoom) || 1);
+      const max = Math.max(80, $('#outline').clientWidth - pad - 40);
+      const size = ev => Math.round(Math.min(max, Math.max(40, w0 + ev.clientX - x0)));
+      const move = ev => { img.style.width = size(ev) + 'px'; chip.classList.add('sized'); };
+      const up = ev => {
+        grip.removeEventListener('pointermove', move); grip.removeEventListener('pointerup', up);
+        const w = size(ev); change(d => { M.find(d, r.id).row.attachments[i].width = w; });
+      };
+      grip.addEventListener('pointermove', move); grip.addEventListener('pointerup', up);
+    });
+    chip.append(grip);
+    return chip;
   }));
 }
 
@@ -301,9 +345,9 @@ function wireRow(el, r, handle, topic) {
   topic.addEventListener('click', e => { if (e.ctrlKey) { const u = urlIn(r.text); if (u) { e.preventDefault(); host.openExternal(/^www\./i.test(u) ? 'https://' + u : u); } } });
   topic.addEventListener('focus', () => {
     if (!state.sel.has(r.id) || state.sel.size > 1) selectOnly(r.id);
-    if (state.zen) topic.scrollIntoView({ block: 'center' });
+    if (state.zen && !state.typewriter) topic.scrollIntoView({ block: 'center' });
   });
-  topic.addEventListener('input', () => { beginEdit(); r.text = readText(topic); touched(); scheduleSidebar(); if (state.zen) topic.scrollIntoView({ block: 'center' }); });
+  topic.addEventListener('input', () => { beginEdit(); r.text = readText(topic); touched(); scheduleSidebar(); if (state.zen && !state.typewriter) topic.scrollIntoView({ block: 'center' }); });
   topic.addEventListener('blur', endEdit);
 }
 let sidebarTimer;
@@ -319,17 +363,24 @@ function renderSidebar() {
     kids.push(item(r.text || 'Untitled row', state.focusId === r.id, () => focusOn(r.id)));
     for (const c of r.children) if (c.children.length) kids.push(item(c.text || 'Untitled row', state.focusId === c.id, () => focusOn(c.id), 'sub'));
   }
+  const results = findResultsEl();
+  if (results) kids.unshift(...results);
   kids.push(h('h4', {}, 'Filters'));
-  for (const [v, l] of [['all', 'All rows'], ['unchecked', 'Unchecked'], ['checked', 'Checked']]) kids.push(item(l, !f.text && f.status === v, () => setFilter('', v)));
-  d.filters.forEach((sf, i) => kids.push(item(sf.name, f.text === sf.text && f.status === sf.status, () => setFilter(sf.text, sf.status), '',
-    h('span', { class: 'x', title: 'Delete this filter', onclick: e => { e.stopPropagation(); change(dd => dd.filters.splice(i, 1)); } }, '✕'))));
+  const noRules = !activeRules().length;
+  for (const [v, l] of [['all', 'All rows'], ['unchecked', 'Unchecked'], ['checked', 'Checked']]) kids.push(item(l, !f.text && noRules && f.status === v, () => setFilter('', v)));
+  const sameRules = sf => JSON.stringify(sf.rules || []) === JSON.stringify(f.rules || []);
+  d.filters.forEach((sf, i) => kids.push(item(sf.name, f.text === sf.text && f.status === sf.status && sameRules(sf), () => setFilter(sf.text, sf.status, sf.rules || []), '',
+    h('span', { class: 'acts' },
+      h('span', { class: 'x', title: 'Edit this filter', onclick: e => { e.stopPropagation(); filterEditor(i); } }, '✎'),
+      h('span', { class: 'x', title: 'Delete this filter', onclick: e => { e.stopPropagation(); change(dd => dd.filters.splice(i, 1)); } }, '✕')))));
   if (filtering()) {
     const inp = h('input', { placeholder: 'Name this filter' });
     kids.push(h('div', { class: 'save-filter' }, inp, h('button', { onclick: () => {
-      const name = inp.value.trim() || f.text || (f.status === 'checked' ? 'Checked' : 'Unchecked');
-      change(dd => dd.filters.push({ name, text: f.text, status: f.status }));
+      const name = inp.value.trim() || describeFilter(f);
+      change(dd => dd.filters.push({ name, text: f.text, status: f.status, rules: JSON.parse(JSON.stringify(f.rules || [])) }));
     } }, 'Save')));
   }
+  kids.push(h('div', { class: 'item more', onclick: () => filterEditor() }, h('span', {}, '+ Filter by column…')));
   kids.push(h('h4', {}, 'Styles'));
   for (const ns of d.styles.named) {
     const { fontSize, ...look } = ns;
@@ -338,9 +389,76 @@ function renderSidebar() {
   $('#sidebar').replaceChildren(...kids);
 }
 function focusOn(id) { state.focusId = id; render(); }
-function setFilter(text, status) {
-  state.filter = { text, status }; $('#filter').value = text; $('#statusFilter').value = status;
+function setFilter(text, status, rules = []) {
+  state.filter = { text, status, rules }; $('#filter').value = text; $('#statusFilter').value = status;
   renderOutline(); renderSidebar(); renderStatus();
+}
+function describeFilter(f) {
+  const parts = [];
+  if (f.text) parts.push(`"${f.text}"`);
+  if (f.status !== 'all') parts.push(f.status === 'checked' ? 'Checked' : 'Unchecked');
+  for (const r of f.rules || []) {
+    const c = state.doc.columns.find(x => x.id === r.col); if (!c) continue;
+    const op = M.RULE_OPS[c.type].find(o => o[0] === r.op);
+    const label = r.op === 'next' ? `is in the next ${r.value} days` : op ? op[1] + (op[2] ? ' ' + r.value : '') : r.op;
+    parts.push(`${c.name} ${label}`);
+  }
+  return parts.join(', ') || 'All rows';
+}
+
+// Saved filters and column conditions: text, checkbox state and any number of column rules.
+function filterEditor(savedIndex) {
+  const d = state.doc, saved = savedIndex !== undefined ? d.filters[savedIndex] : null;
+  const f = JSON.parse(JSON.stringify(saved || state.filter));
+  f.rules = f.rules || [];
+  const name = h('input', { value: saved ? saved.name : '', placeholder: 'Name (to save it in the sidebar)' });
+  const text = h('input', { value: f.text || '', placeholder: 'Rows containing this text' });
+  const status = pick(f.status || 'all', [['all', 'Any'], ['unchecked', 'Unchecked'], ['checked', 'Checked']], v => { f.status = v; });
+  const list = h('div', { class: 'rules' });
+  const drawRules = () => list.replaceChildren(...f.rules.map((r, i) => {
+    const col = d.columns.find(c => c.id === r.col) || d.columns[0];
+    if (!col) return null;
+    const ops = M.RULE_OPS[col.type];
+    if (!ops.some(o => o[0] === r.op)) r.op = ops[0][0];
+    const op = ops.find(o => o[0] === r.op);
+    let val = null;
+    if (op[2]) {
+      if (col.type === 'popup') val = pick(r.value || col.options[0] || '', col.options.map(o => [o, o]), v => { r.value = v; });
+      else if (col.type === 'date' && r.op !== 'next') val = h('input', { type: 'date', value: r.value || '', onchange: e => { r.value = e.target.value; } });
+      else val = h('input', { type: col.type === 'number' || r.op === 'next' ? 'number' : 'text', value: r.value || '', placeholder: col.type === 'duration' ? 'e.g. 2h' : r.op === 'next' ? 'days' : '',
+        oninput: e => { r.value = e.target.value; } });
+      if (col.type === 'popup' && r.value === undefined) r.value = col.options[0] || '';
+    }
+    return h('div', { class: 'rule' },
+      pick(col.id, d.columns.map(c => [c.id, c.name]), v => { r.col = v; r.value = ''; drawRules(); }),
+      pick(r.op, ops.map(o => [o[0], o[1]]), v => { r.op = v; drawRules(); }),
+      val || h('span', { class: 'spacer' }),
+      h('button', { title: 'Remove this condition', onclick: () => { f.rules.splice(i, 1); drawRules(); } }, '✕'));
+  }));
+  drawRules();
+  const read = () => ({ text: text.value, status: f.status || 'all', rules: f.rules.filter(r => d.columns.some(c => c.id === r.col)) });
+  openModal(h('h3', {}, saved ? 'Edit filter' : 'Filter'),
+    h('div', { class: 'form' },
+      h('label', {}, 'Text'), text,
+      h('label', {}, 'Checkbox'), status,
+      h('label', {}, 'Columns'), h('div', {}, list,
+        d.columns.length ? h('button', { onclick: () => { f.rules.push({ col: d.columns[0].id, op: M.RULE_OPS[d.columns[0].type][0][0], value: '' }); drawRules(); } }, '+ Add condition')
+          : h('span', { class: 'hint' }, 'Add a column to the outline to filter by its values.')),
+      h('label', {}, 'Name'), name),
+    h('p', { class: 'hint' }, 'Rows that match every condition are shown, with the rows they sit inside.'),
+    h('div', { class: 'actions' },
+      saved ? h('button', { onclick: () => { change(dd => dd.filters.splice(savedIndex, 1)); closeModal(); } }, 'Delete') : null,
+      h('span', { class: 'spacer' }),
+      h('button', { onclick: closeModal }, 'Cancel'),
+      h('button', { onclick: () => {
+        const nf = read(), nm = name.value.trim();
+        if (saved) change(dd => { dd.filters[savedIndex] = { name: nm || describeFilter(nf), ...nf }; });
+        else if (nm) change(dd => dd.filters.push({ name: nm, ...nf }));
+        closeModal(); setFilter(nf.text, nf.status, nf.rules);
+      } }, saved ? 'Save' : name.value ? 'Save and show' : 'Show'),
+    ));
+  name.addEventListener('input', () => { const b = $('#modal .actions button:last-child'); if (!saved) b.textContent = name.value.trim() ? 'Save and show' : 'Show'; });
+  text.focus();
 }
 function applyNamed(id) {
   const ids = targets(); if (!ids.length) return;
@@ -503,10 +621,18 @@ function renderStatus() {
   const s = M.stats(state.doc), parts = [`${s.rows} rows`, `${s.words} words`];
   if (state.doc.statusVisible) parts.push(`${s.checked} of ${s.leaves} checked`);
   if (state.focusId) parts.push('Focused');
-  if (filtering()) parts.push('Filtered');
+  if (filtering()) parts.push('Filtered: ' + describeFilter(state.filter));
+  if (state.mirrored) parts.push('Shown in another window');
   const saved = flashMsg || (state.path ? (state.dirty ? 'Saving…' : 'Saved') : state.pristine ? '' : 'Not saved yet');
-  $('#statusbar').replaceChildren(...parts.map(p => h('span', {}, p)), h('span', { class: 'right' }, saved));
+  const rec = state.recording;
+  $('#statusbar').replaceChildren(...[...parts.map(p => h('span', {}, p)),
+    rec ? h('button', { class: 'rec', title: 'Stop recording (Ctrl+Shift+R)', onclick: () => cmd.record() }, `● Recording ${clock(rec.seconds)}  Stop`) : null,
+    isOPML() ? h('span', { class: 'badge', title: 'This outline is saved as OPML. Rows, notes, checkboxes and columns are kept; styles are not.' }, 'OPML') : null,
+    h('span', { class: 'right' }, saved)].filter(Boolean));
+  $('#recordBtn').classList.toggle('on', !!rec);
+  if (state.zen) $('#zenStats').textContent = `${s.words} words · ${s.rows} rows`;
 }
+const clock = s => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 const baseName = p => p.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
 function fileBase() { return state.path ? baseName(state.path) : (state.doc.title || 'Untitled').replace(/[\\/:*?"<>|]/g, '-'); }
 function updateTitle() {
@@ -521,9 +647,10 @@ function scheduleAutosave() { if (!state.path || host.web) return; clearTimeout(
 async function save(as = false) {
   clearTimeout(saveTimer);
   let p = state.path;
-  if (as || !p) { p = await host.saveDialog(fileBase() + '.arbor', 'arbor'); if (!p) return false; }
+  if (as || !p) { p = await host.saveDialog(fileBase() + (isOPML() ? '.opml' : '.arbor'), 'save'); if (!p) return false; }
   const v = state.version;
-  try { await host.writeFile(p, JSON.stringify(state.doc, null, 1)); }
+  // OPML mode: an .opml file is edited and saved as OPML, so other outliners can keep using it.
+  try { await host.writeFile(p, /\.opml$/i.test(p) ? M.toOPML(state.doc) : JSON.stringify(state.doc, null, 1)); }
   catch (e) { alert('Could not save the outline.\n\n' + (e.message || e)); return false; }
   if (state.path !== p) { state.path = p; host.setPath(p); }
   state.dirty = state.version !== v; state.pristine = false;
@@ -532,7 +659,7 @@ async function save(as = false) {
   return true;
 }
 function setDoc(doc, path) {
-  Object.assign(state, { doc, path, undo: [], redo: [], sel: new Set(), focusId: null, filter: { text: '', status: 'all' },
+  Object.assign(state, { doc, path, undo: [], redo: [], sel: new Set(), focusId: null, filter: { text: '', status: 'all', rules: [] },
     noteOpen: new Set(), dirty: false, pristine: !path, editing: false });
   $('#filter').value = ''; $('#statusFilter').value = 'all';
   host.setDirty(false); lastDirty = false; host.setPath(path);
@@ -543,21 +670,28 @@ function loadContent(path, content) {
   let doc, native = false;
   try {
     if (ext === 'arbor' || ext === 'json') { doc = M.normalize(JSON.parse(content)); native = true; }
-    else if (ext === 'opml' || ext === 'xml') doc = M.fromOPML(content);
+    else if (ext === 'opml') { doc = M.normalize(M.fromOPML(content)); native = !importing; }
+    else if (ext === 'xml') doc = M.fromOPML(content);
     else if (ext === 'md' || ext === 'markdown') doc = M.fromMarkdown(content, name);
+    else if (ext === 'rtf') doc = Office.fromRTF(content, name);
     else doc = M.fromText(content, name);
   } catch (e) { alert(`Could not open ${name}.\n\n${e.message}`); return; }
   if (!doc.title || doc.title === 'Untitled') doc.title = name;
   setDoc(doc, native && !host.web ? path : null);
   if (!native) { state.pristine = false; touched(); }
 }
+let importing = false; // File > Import makes a new, unsaved outline even from an .opml file
 function openContent(path, content) { if (state.pristine || host.web) loadContent(path, content); else host.openInNewWindow(path); }
-const EXPORTS = { opml: ['opml', M.toOPML], markdown: ['md', M.toMarkdown], text: ['txt', M.toText], html: ['html', M.toHTML], csv: ['csv', M.toCSV] };
+const Office = window.Office;
+const EXPORTS = { opml: ['opml', M.toOPML], markdown: ['md', M.toMarkdown], text: ['txt', M.toText], html: ['html', M.toHTML], csv: ['csv', M.toCSV],
+  rtf: ['rtf', Office.toRTF], xlsx: ['xlsx', Office.toXLSX], docx: ['docx', Office.toDOCX], pptx: ['pptx', Office.toPPTX] };
 async function exportAs(kind) {
   if (kind === 'pdf') { const p = await host.exportPDF(fileBase() + '.pdf'); if (p) flash('Exported PDF'); return; }
   const [ext, fn] = EXPORTS[kind];
   const p = await host.saveDialog(fileBase() + '.' + ext, ext);
-  if (p) { await host.writeFile(p, fn(state.doc)); flash('Exported ' + ext.toUpperCase()); }
+  if (!p) return;
+  try { await host.writeFile(p, fn(state.doc)); flash('Exported ' + ext.toUpperCase()); }
+  catch (e) { alert('Could not export.\n\n' + (e.message || e)); }
 }
 function focusFirst() { const t = document.querySelector('#rows .topic'); if (t && !t.textContent && rowEls().length === 1) setCaret(t, 'end'); }
 
@@ -573,20 +707,37 @@ function findMatches() {
   });
   return out;
 }
-function findGo(dir) {
+function findGo(dir, exact) {
   const ms = state.find.matches = findMatches();
-  if (!ms.length) { state.find.idx = -1; $('#findCount').textContent = $('#findText').value ? 'No matches' : ''; highlightFind(); return; }
-  state.find.idx = state.find.idx < 0 && dir < 0 ? ms.length - 1 : (state.find.idx + dir + ms.length) % ms.length;
+  if (!ms.length) { state.find.idx = -1; $('#findCount').textContent = $('#findText').value ? 'No matches' : ''; highlightFind(); renderSidebar(); return; }
+  state.find.idx = exact !== undefined ? exact : state.find.idx < 0 && dir < 0 ? ms.length - 1 : (state.find.idx + dir + ms.length) % ms.length;
   const m = ms[state.find.idx];
   reveal(m.id, m.field);
   $('#findCount').textContent = `${state.find.idx + 1} of ${ms.length}`;
+}
+// Batch find: every match listed in the sidebar with its surrounding words; click one to go there.
+function findResultsEl() {
+  const q = $('#findText').value;
+  if ($('#findbar').hidden || !q) return null;
+  const ms = state.find.matches, out = [h('h4', {}, `Find results (${ms.length})`)];
+  if (!ms.length) out.push(h('div', { class: 'item muted' }, h('span', {}, 'No matches')));
+  ms.slice(0, 300).forEach((m, i) => {
+    const r = M.find(state.doc, m.id); if (!r) return;
+    const t = r.row[m.field], a = Math.max(0, m.index - 24), b = Math.min(t.length, m.index + m.length + 40);
+    const before = (a ? '…' : '') + t.slice(a, m.index), hit = t.slice(m.index, m.index + m.length), after = t.slice(m.index + m.length, b) + (b < t.length ? '…' : '');
+    out.push(h('div', { class: 'item result' + (i === state.find.idx ? ' active' : ''), title: (m.field === 'note' ? 'In the note of: ' : '') + (r.row.text || 'Untitled row'),
+      onclick: () => findGo(0, i) },
+      h('span', {}, m.field === 'note' ? h('em', { class: 'tag' }, 'note') : null, before.replace(/\n/g, ' '), h('mark', {}, hit), after.replace(/\n/g, ' '))));
+  });
+  if (ms.length > 300) out.push(h('div', { class: 'item muted' }, h('span', {}, `and ${ms.length - 300} more`)));
+  return out;
 }
 function reveal(id, fld = 'topic') {
   const d = state.doc; if (!M.find(d, id)) return;
   const anc = M.ancestors(d, id);
   anc.forEach(a => { a.collapsed = false; });
   if (state.focusId && state.focusId !== id && !anc.some(a => a.id === state.focusId)) state.focusId = null;
-  if (filtering() && !M.visibleRows(d, { focusId: state.focusId, ...state.filter }).some(v => v.row.id === id)) setFilter('', 'all');
+  if (filtering() && !M.visibleRows(d, visibleOpts()).some(v => v.row.id === id)) setFilter('', 'all');
   if (fld === 'note') { state.noteOpen.add(id); d.notesVisible = true; }
   renderOutline(); renderSidebar();
   const el = rowElById(id); if (el) el.scrollIntoView({ block: 'center' });
@@ -686,8 +837,43 @@ function setCollapsed(on, all) {
     else targets().forEach(id => { const r = M.find(d, id).row; if (r.children.length) r.collapsed = on; });
   });
 }
+// ---------------------------------------------------------------- audio recording
+async function toggleRecording() {
+  const rec = state.recording;
+  if (rec) { rec.recorder.stop(); return; }
+  const id = targets()[0] || activeRowId();
+  if (!id) return flash('Select a row to record into');
+  if (!navigator.mediaDevices || !window.MediaRecorder) return alert('Recording is not available here.');
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { return alert('Could not use the microphone.\n\nCheck that a microphone is connected and that Windows allows apps to use it (Settings > Privacy & security > Microphone).\n\n' + (e.message || e)); }
+  const type = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : '';
+  const recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined), chunks = [];
+  const started = new Date();
+  state.recording = { recorder, seconds: 0, rowId: id, timer: setInterval(() => { state.recording.seconds++; renderStatus(); }, 1000) };
+  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = async () => {
+    clearInterval(state.recording.timer); stream.getTracks().forEach(t => t.stop());
+    const rowId = state.recording.rowId; state.recording = null; renderStatus();
+    const bytes = new Uint8Array(await new Blob(chunks, { type: 'audio/webm' }).arrayBuffer());
+    if (!bytes.length) return;
+    const pad = n => String(n).padStart(2, '0');
+    const name = `Recording ${started.getFullYear()}-${pad(started.getMonth() + 1)}-${pad(started.getDate())} ${pad(started.getHours())}.${pad(started.getMinutes())}.${pad(started.getSeconds())}.webm`;
+    try {
+      const p = host.saveRecording ? await host.saveRecording(state.path, name, bytes) : null;
+      if (!p) return alert('Recordings are saved by the Windows app.');
+      if (!M.find(state.doc, rowId)) return flash('Recording saved to ' + p);
+      change(d => M.find(d, rowId).row.attachments.push({ name, path: p }));
+      flash('Recording added');
+    } catch (e) { alert('Could not save the recording.\n\n' + (e.message || e)); }
+  };
+  recorder.start(1000);
+  renderStatus();
+}
+
 function openModal(...kids) { $('#modal').replaceChildren(h('div', { class: 'box' }, ...kids)); $('#modal').hidden = false; }
-function closeModal() { $('#modal').hidden = true; $('#modal').replaceChildren(); }
+const closeHooks = []; // undo anything a dialog set up, however it is closed
+function closeModal() { $('#modal').hidden = true; $('#modal').replaceChildren(); while (closeHooks.length) closeHooks.pop()(); }
 
 // ---------------------------------------------------------------- automation
 const EXAMPLE_SCRIPT = `// Runs against this outline. Press Ctrl+Z afterwards to undo.
@@ -811,7 +997,7 @@ const cmd = {
     state.find = { idx: -1, matches: [] };
     $('#findCount').textContent = `Replaced ${n}`;
   },
-  closeFind() { $('#findbar').hidden = true; state.find = { idx: -1, matches: [] }; highlightFind(); const t = document.querySelector('#rows .row.selected .topic'); if (t) setCaret(t, 'end'); },
+  closeFind() { $('#findbar').hidden = true; state.find = { idx: -1, matches: [] }; highlightFind(); renderSidebar(); const t = document.querySelector('#rows .row.selected .topic'); if (t) setCaret(t, 'end'); },
   copyLink() {
     if (!state.path) return alert('Save the outline first, then you can copy a link to a row.');
     const id = targets()[0];
@@ -821,16 +1007,29 @@ const cmd = {
   newDoc: () => host.newWindow(),
   template(key) { if (state.pristine || host.web) setDoc(M.fromTemplate(key), null); else host.newWindow(key); },
   async open(kind) { const f = await host.openDialog(kind || 'all'); if (f) openContent(f.path, f.content); },
-  import(kind) { return cmd.open(kind); },
+  async import(kind) { importing = true; try { await cmd.open(kind); } finally { importing = false; } },
+  filterEditor: () => filterEditor(),
+  clearFilter: () => setFilter('', 'all'),
+  toggleFolded() { state.folded = !state.folded; setPref('folded', state.folded); applyTheme(); flash(state.folded ? 'Folded editing on' : 'Folded editing off'); },
+  toggleTypewriter() { state.typewriter = !state.typewriter; setPref('typewriter', state.typewriter); applyTheme(); centerCaret(); flash(state.typewriter ? 'Typewriter scrolling on' : 'Typewriter scrolling off'); },
+  mirrorWindow() {
+    if (!host.mirrorWindow) return host.newWindow();
+    endEdit(); state.mirrored = true; host.mirrorWindow(JSON.stringify(state.doc), state.path); renderStatus();
+  },
+  unmirror() { state.mirrored = false; renderStatus(); },
+  markDirty() { if (!state.dirty) { state.dirty = true; host.setDirty(true); lastDirty = true; } scheduleAutosave(); renderStatus(); },
+  record: () => toggleRecording(),
+  async attachFiles() {
+    const id = targets()[0]; if (!id) return flash('Select a row first');
+    const ps = await host.pickFiles();
+    if (ps && ps.length) change(d => M.find(d, id).row.attachments.push(...ps.map(p => ({ name: p.split(/[\\/]/).pop(), path: p }))));
+  },
   export: kind => exportAs(kind),
   save: () => save(false), saveAs: () => save(true),
   async saveThenClose() { if (await save(false)) host.closeWindow(); },
   print: () => host.print(),
   automation: automationConsole,
-  shortcuts() {
-    openModal(h('h3', {}, 'Keyboard shortcuts'), h('table', {}, SHORTCUTS.map(([k, v]) => h('tr', {}, h('td', {}, h('kbd', {}, k)), h('td', {}, v)))),
-      h('div', { class: 'actions' }, h('button', { class: 'on', onclick: closeModal }, 'Close')));
-  },
+  shortcuts: () => shortcutsEditor(),
   selectAll() { if (isTyping()) return document.execCommand('selectAll'); state.sel = new Set(rowEls().map(e => e.dataset.id)); paintSelection(); },
 };
 function run(action) {
@@ -840,6 +1039,19 @@ function run(action) {
 }
 
 // ---------------------------------------------------------------- keyboard
+// Typewriter scrolling: the line being typed stays in the middle of the window.
+function centerCaret() {
+  if (!state.typewriter) return;
+  const a = document.activeElement; if (!a || !a.closest || !a.closest('#rows')) return;
+  const s = getSelection(); if (!s.rangeCount) return;
+  let rect = s.getRangeAt(0).getBoundingClientRect();
+  if (!rect.height) rect = a.getBoundingClientRect();
+  const o = $('#outline'), ob = o.getBoundingClientRect();
+  const delta = (rect.top + rect.height / 2) - (ob.top + ob.height * 0.45);
+  if (Math.abs(delta) > 2) o.scrollTop += delta;
+}
+document.addEventListener('selectionchange', () => { if (state.typewriter) requestAnimationFrame(centerCaret); });
+
 const ROW_KEYS = {
   'Tab': 'indent', 'Shift+Tab': 'outdent', 'Ctrl+Shift+ArrowUp': 'moveUp', 'Ctrl+Shift+ArrowDown': 'moveDown',
   'Ctrl+Enter': 'toggleStatus', 'Ctrl+Shift+Enter': 'newChild', 'Alt+ArrowLeft': 'collapse', 'Alt+ArrowRight': 'expand',
@@ -851,9 +1063,91 @@ const GLOBAL_KEYS = {
   'Ctrl+z': 'undo', 'Ctrl+y': 'redo', 'Ctrl+Shift+Z': 'redo', 'Ctrl+f': 'find', 'Ctrl+h': 'replace',
   'F3': 'findNext', 'Shift+F3': 'findPrev', 'Ctrl+Shift+D': 'toggleZen', 'Ctrl+Shift+L': 'toggleSidebar', 'Ctrl+Shift+I': 'toggleInspector',
 };
+const DEFAULT_ROW_KEYS = { ...ROW_KEYS }, DEFAULT_GLOBAL_KEYS = { ...GLOBAL_KEYS };
 function keyName(e) {
-  const k = e.key.length === 1 && !e.shiftKey ? e.key.toLowerCase() : e.key;
+  // Letters and digits by their key position, so Shift and keyboard layouts don't change the name.
+  let k = /^Key[A-Z]$/.test(e.code) ? e.code.slice(3) : /^Digit\d$/.test(e.code) ? e.code.slice(5) : e.key;
+  if (k.length === 1) k = e.shiftKey ? k.toUpperCase() : k.toLowerCase();
   return [e.ctrlKey && 'Ctrl', e.altKey && 'Alt', e.shiftKey && 'Shift'].filter(Boolean).concat(k).join('+');
+}
+// Electron accelerator ("Ctrl+Shift+Up") to the name keyName() gives ("Ctrl+Shift+ArrowUp").
+const ACCEL_KEYS = { Up: 'ArrowUp', Down: 'ArrowDown', Left: 'ArrowLeft', Right: 'ArrowRight', Space: ' ', Esc: 'Escape', Return: 'Enter', Plus: '+', PageUp: 'PageUp', PageDown: 'PageDown' };
+function accelToKey(a) {
+  if (!a) return '';
+  const parts = a.split('+').filter(Boolean); let k = parts.pop() || '';
+  if (a.endsWith('++')) k = '+';
+  const mods = new Set(parts.map(p => p.replace(/^(CmdOrCtrl|CommandOrControl|Control)$/, 'Ctrl')));
+  k = ACCEL_KEYS[k] || k;
+  if (k.length === 1) k = mods.has('Shift') ? k.toUpperCase() : k.toLowerCase();
+  return ['Ctrl', 'Alt', 'Shift'].filter(m => mods.has(m)).concat(k).join('+');
+}
+function keyToAccel(name) {
+  const parts = name.split('+'); let k = parts.pop() || '+';
+  if (name.endsWith('++')) k = '+';
+  const back = Object.fromEntries(Object.entries(ACCEL_KEYS).map(([a, b]) => [b, a]));
+  k = back[k] || (k.length === 1 ? k.toUpperCase() : k);
+  return parts.concat(k).join('+');
+}
+// Shortcuts the person changed replace the built-in ones for those commands.
+function applyShortcuts(over) {
+  state.shortcuts = over || {};
+  const taken = new Set(Object.values(state.shortcuts).filter(Boolean).map(accelToKey));
+  for (const [map, dflt] of [[ROW_KEYS, DEFAULT_ROW_KEYS], [GLOBAL_KEYS, DEFAULT_GLOBAL_KEYS]]) {
+    for (const k of Object.keys(map)) delete map[k];
+    for (const [k, action] of Object.entries(dflt)) if (!(action in state.shortcuts) && !taken.has(k)) map[k] = action;
+  }
+}
+// Help > Keyboard Shortcuts: every menu command, with the key for it; click a key to change it.
+async function shortcutsEditor() {
+  const info = host.getShortcuts ? await host.getShortcuts() : { commands: [], overrides: {} };
+  const over = { ...info.overrides };
+  const keyOf = c => (c.action in over ? over[c.action] : c.default) || '';
+  const pretty = a => a ? a.replace(/\bUp\b/, '↑').replace(/\bDown\b/, '↓').replace(/\bLeft\b/, '←').replace(/\bRight\b/, '→') : '';
+  const search = h('input', { type: 'search', placeholder: 'Search commands' });
+  const msg = h('div', { class: 'hint' }, 'Click a shortcut, then press the new keys. Backspace removes it; Esc cancels.');
+  const body = h('tbody');
+  let recording = null;
+  const draw = () => {
+    const q = search.value.trim().toLowerCase();
+    body.replaceChildren(...info.commands.filter(c => !q || (c.menu + ' ' + c.label).toLowerCase().includes(q)).map(c => {
+      const custom = c.action in over;
+      const btn = h('button', { class: 'keycap' + (recording === c.action ? ' recording' : '') + (custom ? ' custom' : ''),
+        onclick: () => { recording = c.action; draw(); } }, recording === c.action ? 'Press keys…' : pretty(keyOf(c)) || 'None');
+      return h('tr', {}, h('td', { class: 'menu' }, c.menu), h('td', {}, c.label), h('td', {}, btn),
+        h('td', {}, custom ? h('button', { title: 'Use the original shortcut', onclick: () => { delete over[c.action]; draw(); } }, 'Reset') : null));
+    }));
+  };
+  const onKey = e => {
+    if (!recording) return;
+    e.preventDefault(); e.stopPropagation();
+    if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
+    if (e.key === 'Escape' && !e.ctrlKey && !e.altKey) { recording = null; draw(); return; }
+    const c = info.commands.find(x => x.action === recording);
+    if ((e.key === 'Backspace' || e.key === 'Delete') && !e.ctrlKey && !e.altKey) { over[c.action] = ''; recording = null; draw(); return; }
+    const fkey = /^F\d{1,2}$/.test(e.key);
+    if (!e.ctrlKey && !e.altKey && !fkey) { msg.textContent = 'Use Ctrl or Alt with the key (or a function key), so typing is not affected.'; msg.classList.add('warn'); return; }
+    const accel = keyToAccel(keyName(e));
+    const clash = info.commands.find(x => x.action !== c.action && keyOf(x).toLowerCase() === accel.toLowerCase());
+    if (clash) { over[clash.action] = ''; msg.textContent = `${accel} was used by “${clash.label}”, which now has no shortcut.`; msg.classList.add('warn'); }
+    else { msg.textContent = 'Click a shortcut, then press the new keys. Backspace removes it; Esc cancels.'; msg.classList.remove('warn'); }
+    over[c.action] = accel === c.default ? undefined : accel;
+    if (over[c.action] === undefined) delete over[c.action];
+    recording = null; draw();
+  };
+  document.addEventListener('keydown', onKey, true);
+  search.addEventListener('input', draw);
+  draw();
+  const done = closeModal;
+  openModal(h('h3', {}, 'Keyboard shortcuts'), h('div', { class: 'row-between' }, search, msg),
+    h('div', { class: 'scroll' }, h('table', { class: 'keys' }, body)),
+    h('h5', {}, 'Other keys'),
+    h('table', {}, SHORTCUTS.filter(([k]) => /Esc|Space|Delete|Shift\+Enter|Up \/ Down|Click/.test(k)).map(([k, v]) => h('tr', {}, h('td', {}, h('kbd', {}, k)), h('td', {}, v)))),
+    h('div', { class: 'actions' },
+      h('button', { onclick: () => { for (const k of Object.keys(over)) delete over[k]; draw(); } }, 'Reset all'),
+      h('span', { class: 'spacer' }),
+      h('button', { onclick: done }, 'Cancel'),
+      h('button', { class: 'on', onclick: async () => { if (host.setShortcuts) await host.setShortcuts(over); applyShortcuts(over); done(); flash('Shortcuts saved'); } }, 'Save')));
+  closeHooks.push(() => document.removeEventListener('keydown', onKey, true));
 }
 document.addEventListener('keydown', e => {
   const k = keyName(e), t = e.target;
@@ -911,8 +1205,8 @@ function selectionKey(e, k) {
 document.addEventListener('click', e => { const b = e.target.closest('button[data-cmd]'); if (b) run(b.dataset.cmd); });
 // Toolbar buttons must not steal the text cursor from the row being edited.
 for (const s of ['#toolbar', '#findbar', '#focusbar']) $(s).addEventListener('mousedown', e => { if (e.target.closest('button')) e.preventDefault(); });
-$('#filter').addEventListener('input', e => setFilter(e.target.value, state.filter.status));
-$('#statusFilter').addEventListener('change', e => setFilter(state.filter.text, e.target.value));
+$('#filter').addEventListener('input', e => setFilter(e.target.value, state.filter.status, state.filter.rules));
+$('#statusFilter').addEventListener('change', e => setFilter(state.filter.text, e.target.value, state.filter.rules));
 $('#findText').addEventListener('input', () => { state.find.idx = -1; findGo(1); });
 $('#findCase').addEventListener('change', () => { state.find.idx = -1; findGo(1); });
 $('#modal').addEventListener('mousedown', e => { if (e.target.id === 'modal') closeModal(); });
@@ -921,7 +1215,7 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', async e => {
   e.preventDefault();
   for (const f of e.dataTransfer.files) {
-    if (!/\.(arbor|opml|md|markdown|txt)$/i.test(f.name)) continue;
+    if (!/\.(arbor|opml|md|markdown|txt|rtf)$/i.test(f.name)) continue;
     const p = host.pathForFile(f);
     if (p && !host.web) host.openInNewWindow(p); else openContent(f.name, await f.text());
   }
@@ -929,9 +1223,12 @@ document.addEventListener('drop', async e => {
 host.onMenu(run);
 host.onLoad(({ path, content, reveal: rid }) => { loadContent(path, content); if (rid) { reveal(rid); selectOnly(rid); } });
 host.onReveal(id => { reveal(id); selectOnly(id); });
+if (host.onShortcuts) host.onShortcuts(applyShortcuts);
+if (host.onSync) host.onSync(receiveSync);
+if (host.onMirror) host.onMirror(m => { setDoc(M.normalize(JSON.parse(m.doc)), m.path || null); state.mirrored = true; state.pristine = false; renderStatus(); });
 render();
 focusFirst();
-window.__arbor = { state, cmd, run, M, loadContent, save, setDoc, runScript }; // used by the automated tests
+window.__arbor = { state, cmd, run, M, loadContent, save, setDoc, runScript, applyShortcuts, keyName, accelToKey, keyToAccel }; // used by the automated tests
 
 // ---------------------------------------------------------------- browser fallback (the app also runs in a plain browser)
 function webShim() {
@@ -941,14 +1238,14 @@ function webShim() {
     i.click();
   });
   const download = (name, content) => {
-    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type: 'text/plain' }));
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content], { type: typeof content === 'string' ? 'text/plain' : 'application/octet-stream' }));
     a.download = name.split(/[\\/]/).pop(); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   };
   const none = () => {};
   return {
     web: true, onMenu: none, onLoad: none, onReveal: none, setDirty: none, setPath: none,
     setFullScreen: on => { if (on && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(none); else if (!on && document.fullscreenElement) document.exitFullscreen(); },
-    openDialog: () => pickFile('.arbor,.opml,.md,.markdown,.txt,.json'),
+    openDialog: () => pickFile('.arbor,.opml,.md,.markdown,.txt,.json,.rtf'),
     saveDialog: async name => name, writeFile: async (p, c) => download(p, c),
     exportPDF: async () => { window.print(); return null; }, print: () => window.print(),
     openExternal: u => window.open(u, '_blank', 'noopener'), openPath: none, pathForFile: () => '',
