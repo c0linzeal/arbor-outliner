@@ -49,7 +49,7 @@ function createWindow(file, extra = {}) {
   const win = new BrowserWindow({
     width: 1200, height: 800, minWidth: 640, minHeight: 420, x, y, show: !PROBE,
     title: 'Arbor Outliner', backgroundColor: nativeTheme.shouldUseDarkColors ? '#1e1f22' : '#ffffff',
-    icon: path.join(__dirname, 'build', 'icon.png'),
+    icon: path.join(__dirname, 'assets', 'icon.png'),
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true, spellcheck: true },
   });
   const id = win.webContents.id;

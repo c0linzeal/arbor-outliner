@@ -1,4 +1,4 @@
-// Draws the app icon (build/icon.png, 256x256): a rounded tile with outline bars.
+// Draws the app icon (assets/icon.png, 256x256): a rounded tile with outline bars.
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
@@ -43,5 +43,5 @@ const chunk = (type, data) => {
 const ihdr = Buffer.alloc(13);
 ihdr.writeUInt32BE(S, 0); ihdr.writeUInt32BE(S, 4); ihdr[8] = 8; ihdr[9] = 6;
 const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
-fs.writeFileSync(path.join(__dirname, '..', 'build', 'icon.png'), png);
-console.log('build/icon.png written');
+fs.writeFileSync(path.join(__dirname, '..', 'assets', 'icon.png'), png);
+console.log('assets/icon.png written');

@@ -1,0 +1,59 @@
+{
+  "appId": "io.github.c0linzeal.arbor-outliner",
+  "productName": "Arbor Outliner",
+  "directories": {
+    "output": "release",
+    "buildResources": "assets"
+  },
+  "files": [
+    "main.js",
+    "preload.js",
+    "src/**/*",
+    "assets/icon.png",
+    "package.json"
+  ],
+  "win": {
+    "target": [
+      "nsis"
+    ],
+    "icon": "assets/icon.png"
+  },
+  "nsis": {
+    "oneClick": true,
+    "perMachine": false,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "Arbor Outliner",
+    "artifactName": "Arbor-Outliner-Setup-${version}.${ext}"
+  },
+  "fileAssociations": [
+    {
+      "ext": "arbor",
+      "name": "Arbor Outline",
+      "description": "Arbor outline",
+      "role": "Editor"
+    },
+    {
+      "ext": "opml",
+      "name": "OPML Outline",
+      "description": "OPML outline",
+      "role": "Editor"
+    }
+  ],
+  "protocols": [
+    {
+      "name": "Arbor Outliner link",
+      "schemes": [
+        "arbor"
+      ]
+    }
+  ],
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "c0linzeal",
+      "repo": "arbor-outliner",
+      "releaseType": "release"
+    }
+  ]
+}

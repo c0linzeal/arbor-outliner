@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' file: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval'">
+  <title>Arbor Outliner</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="toolbar">
+    <button data-cmd="toggleSidebar" title="Show or hide the sidebar (Ctrl+Shift+S)">&#9776;</button>
+    <span id="docTitle"></span>
+    <div class="spacer"></div>
+    <div class="group">
+      <button data-cmd="newRow" title="New row (Enter)">+ Row</button>
+      <button data-cmd="newChild" title="New child row (Ctrl+Shift+Enter)">+ Child</button>
+      <button data-cmd="outdent" title="Move left (Shift+Tab)">&#8676;</button>
+      <button data-cmd="indent" title="Move right (Tab)">&#8677;</button>
+      <button data-cmd="moveUp" title="Move up (Ctrl+Shift+Up)">&#8593;</button>
+      <button data-cmd="moveDown" title="Move down (Ctrl+Shift+Down)">&#8595;</button>
+    </div>
+    <div class="group">
+      <button data-cmd="toggleStatus" title="Check or uncheck (Ctrl+Enter)">&#9745;</button>
+      <button data-cmd="toggleNote" title="Add or edit a note (Ctrl+')">Note</button>
+      <button data-cmd="focus" title="Focus on the selected rows (Ctrl+Shift+F)">Focus</button>
+      <button data-cmd="addColumn" title="Add a column">+ Column</button>
+    </div>
+    <input id="filter" type="search" placeholder="Filter" title="Show only rows that contain this text">
+    <select id="statusFilter" title="Show rows by checkbox">
+      <option value="all">All rows</option>
+      <option value="unchecked">Unchecked</option>
+      <option value="checked">Checked</option>
+    </select>
+    <button data-cmd="toggleInspector" title="Show or hide the inspector (Ctrl+Shift+I)">&#9432;</button>
+  </header>
+  <div id="findbar" hidden>
+    <input id="findText" placeholder="Find">
+    <input id="replaceText" placeholder="Replace with">
+    <label><input type="checkbox" id="findCase"> Match case</label>
+    <button data-cmd="findPrev" title="Previous (Shift+F3)">&#8249;</button>
+    <button data-cmd="findNext" title="Next (F3)">&#8250;</button>
+    <button data-cmd="replaceOne">Replace</button>
+    <button data-cmd="replaceAll">Replace All</button>
+    <span id="findCount"></span>
+    <button data-cmd="closeFind" title="Close (Esc)">&#10005;</button>
+  </div>
+  <main>
+    <nav id="sidebar"></nav>
+    <section id="outline" tabindex="-1">
+      <div id="focusbar" hidden></div>
+      <div id="header"></div>
+      <div id="rows"></div>
+    </section>
+    <aside id="inspector"></aside>
+  </main>
+  <footer id="statusbar"></footer>
+  <button id="zenExit" data-cmd="toggleZen" title="Leave distraction-free mode (Ctrl+Shift+D)">Exit</button>
+  <div id="modal" hidden></div>
+  <script src="model.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
